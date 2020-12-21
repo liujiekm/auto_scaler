@@ -17,16 +17,17 @@ limitations under the License.
 package iscsi
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
 	"k8s.io/utils/keymutex"
-	"k8s.io/utils/mount"
 	utilstrings "k8s.io/utils/strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -37,7 +38,7 @@ import (
 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 )
 
-// This is the primary entrypoint for volume plugins.
+//  ProbeVolumePlugins is the primary entrypoint for volume plugins.
 func ProbeVolumePlugins() []volume.VolumePlugin {
 	return []volume.VolumePlugin{&iscsiPlugin{}}
 }
@@ -78,7 +79,7 @@ func (plugin *iscsiPlugin) CanSupport(spec *volume.Spec) bool {
 	return (spec.Volume != nil && spec.Volume.ISCSI != nil) || (spec.PersistentVolume != nil && spec.PersistentVolume.Spec.ISCSI != nil)
 }
 
-func (plugin *iscsiPlugin) RequiresRemount() bool {
+func (plugin *iscsiPlugin) RequiresRemount(spec *volume.Spec) bool {
 	return false
 }
 
@@ -282,7 +283,7 @@ type iscsiDisk struct {
 	Iface         string
 	chapDiscovery bool
 	chapSession   bool
-	secret        map[string]string
+	secret        map[string]string `datapolicy:"token"`
 	InitiatorName string
 	plugin        *iscsiPlugin
 	// Utility interface that provides API calls to the provider to attach/detach disks.
@@ -344,7 +345,7 @@ func (b *iscsiDiskMounter) SetUp(mounterArgs volume.MounterArgs) error {
 
 func (b *iscsiDiskMounter) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
 	// diskSetUp checks mountpoints and prevent repeated calls
-	err := diskSetUp(b.manager, *b, dir, b.mounter, mounterArgs.FsGroup)
+	err := diskSetUp(b.manager, *b, dir, b.mounter, mounterArgs.FsGroup, mounterArgs.FSGroupChangePolicy, b.plugin)
 	if err != nil {
 		klog.Errorf("iscsi: failed to setup")
 	}
@@ -590,7 +591,7 @@ func createSecretMap(spec *volume.Spec, plugin *iscsiPlugin, namespace string) (
 			if kubeClient == nil {
 				return nil, fmt.Errorf("Cannot get kube client")
 			}
-			secretObj, err := kubeClient.CoreV1().Secrets(secretNamespace).Get(secretName, metav1.GetOptions{})
+			secretObj, err := kubeClient.CoreV1().Secrets(secretNamespace).Get(context.TODO(), secretName, metav1.GetOptions{})
 			if err != nil {
 				err = fmt.Errorf("Couldn't get secret %v/%v error: %v", secretNamespace, secretName, err)
 				return nil, err

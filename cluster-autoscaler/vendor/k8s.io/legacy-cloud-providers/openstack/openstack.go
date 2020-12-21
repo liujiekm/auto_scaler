@@ -52,7 +52,7 @@ import (
 	certutil "k8s.io/client-go/util/cert"
 	cloudprovider "k8s.io/cloud-provider"
 	nodehelpers "k8s.io/cloud-provider/node/helpers"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -158,7 +158,7 @@ type Config struct {
 		AuthURL         string `gcfg:"auth-url"`
 		Username        string
 		UserID          string `gcfg:"user-id"`
-		Password        string
+		Password        string `datapolicy:"password"`
 		TenantID        string `gcfg:"tenant-id"`
 		TenantName      string `gcfg:"tenant-name"`
 		TrustID         string `gcfg:"trust-id"`
@@ -295,7 +295,7 @@ func setConfigFromSecret(cfg *Config) error {
 		return fmt.Errorf("failed to get kubernetes client: %v", err)
 	}
 
-	secret, err := k8sClient.CoreV1().Secrets(secretNamespace).Get(secretName, metav1.GetOptions{})
+	secret, err := k8sClient.CoreV1().Secrets(secretNamespace).Get(context.TODO(), secretName, metav1.GetOptions{})
 	if err != nil {
 		klog.Warningf("Cannot get secret %s in namespace %s. error: %q", secretName, secretNamespace, err)
 		return err

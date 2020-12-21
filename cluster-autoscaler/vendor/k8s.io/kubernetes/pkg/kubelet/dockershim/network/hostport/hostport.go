@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2017 The Kubernetes Authors.
 
@@ -21,7 +23,7 @@ import (
 	"net"
 	"strings"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
 	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
@@ -36,7 +38,6 @@ const (
 
 // PortMapping represents a network port in a container
 type PortMapping struct {
-	Name          string
 	HostPort      int32
 	ContainerPort int32
 	Protocol      v1.Protocol
@@ -137,7 +138,7 @@ func ensureKubeHostportChains(iptables utiliptables.Interface, natInterfaceName 
 	if natInterfaceName != "" && natInterfaceName != "lo" {
 		// Need to SNAT traffic from localhost
 		localhost := "127.0.0.0/8"
-		if iptables.IsIpv6() {
+		if iptables.IsIPv6() {
 			localhost = "::1/128"
 		}
 		args = []string{"-m", "comment", "--comment", "SNAT for localhost access to hostports", "-o", natInterfaceName, "-s", localhost, "-j", "MASQUERADE"}

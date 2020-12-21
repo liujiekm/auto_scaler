@@ -24,7 +24,7 @@ import (
 	"time"
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,22 +35,24 @@ import (
 	"k8s.io/client-go/tools/record"
 	ref "k8s.io/client-go/tools/reference"
 	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/component-base/logs/logreduction"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/credentialprovider"
+	"k8s.io/kubernetes/pkg/credentialprovider/plugin"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/images"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/kubernetes/pkg/kubelet/logs"
 	proberesults "k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/runtimeclass"
 	"k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/cache"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
-	"k8s.io/kubernetes/pkg/kubelet/util/logreduction"
 )
 
 const (
@@ -79,10 +81,9 @@ type podStateProvider interface {
 }
 
 type kubeGenericRuntimeManager struct {
-	runtimeName         string
-	recorder            record.EventRecorder
-	osInterface         kubecontainer.OSInterface
-	containerRefManager *kubecontainer.RefManager
+	runtimeName string
+	recorder    record.EventRecorder
+	osInterface kubecontainer.OSInterface
 
 	// machineInfo contains the machine information.
 	machineInfo *cadvisorapi.MachineInfo
@@ -128,6 +129,9 @@ type kubeGenericRuntimeManager struct {
 	// A shim to legacy functions for backward compatibility.
 	legacyLogProvider LegacyLogProvider
 
+	// Manage container logs.
+	logManager logs.ContainerLogManager
+
 	// Manage RuntimeClass resources.
 	runtimeClassManager *runtimeclass.Manager
 
@@ -139,7 +143,7 @@ type kubeGenericRuntimeManager struct {
 type KubeGenericRuntime interface {
 	kubecontainer.Runtime
 	kubecontainer.StreamingRuntime
-	kubecontainer.ContainerCommandRunner
+	kubecontainer.CommandRunner
 }
 
 // LegacyLogProvider gives the ability to use unsupported docker log drivers (e.g. journald)
@@ -154,22 +158,24 @@ func NewKubeGenericRuntimeManager(
 	livenessManager proberesults.Manager,
 	startupManager proberesults.Manager,
 	seccompProfileRoot string,
-	containerRefManager *kubecontainer.RefManager,
 	machineInfo *cadvisorapi.MachineInfo,
 	podStateProvider podStateProvider,
 	osInterface kubecontainer.OSInterface,
 	runtimeHelper kubecontainer.RuntimeHelper,
-	httpClient types.HttpGetter,
+	httpClient types.HTTPGetter,
 	imageBackOff *flowcontrol.Backoff,
 	serializeImagePulls bool,
 	imagePullQPS float32,
 	imagePullBurst int,
+	imageCredentialProviderConfigFile string,
+	imageCredentialProviderBinDir string,
 	cpuCFSQuota bool,
 	cpuCFSQuotaPeriod metav1.Duration,
 	runtimeService internalapi.RuntimeService,
 	imageService internalapi.ImageManagerService,
 	internalLifecycle cm.InternalContainerLifecycle,
 	legacyLogProvider LegacyLogProvider,
+	logManager logs.ContainerLogManager,
 	runtimeClassManager *runtimeclass.Manager,
 ) (KubeGenericRuntime, error) {
 	kubeRuntimeManager := &kubeGenericRuntimeManager{
@@ -179,20 +185,19 @@ func NewKubeGenericRuntimeManager(
 		seccompProfileRoot:  seccompProfileRoot,
 		livenessManager:     livenessManager,
 		startupManager:      startupManager,
-		containerRefManager: containerRefManager,
 		machineInfo:         machineInfo,
 		osInterface:         osInterface,
 		runtimeHelper:       runtimeHelper,
 		runtimeService:      newInstrumentedRuntimeService(runtimeService),
 		imageService:        newInstrumentedImageManagerService(imageService),
-		keyring:             credentialprovider.NewDockerKeyring(),
 		internalLifecycle:   internalLifecycle,
 		legacyLogProvider:   legacyLogProvider,
+		logManager:          logManager,
 		runtimeClassManager: runtimeClassManager,
 		logReduction:        logreduction.NewLogReduction(identicalErrorDelay),
 	}
 
-	typedVersion, err := kubeRuntimeManager.runtimeService.Version(kubeRuntimeAPIVersion)
+	typedVersion, err := kubeRuntimeManager.getTypedVersion()
 	if err != nil {
 		klog.Errorf("Get runtime version failed: %v", err)
 		return nil, err
@@ -221,6 +226,18 @@ func NewKubeGenericRuntimeManager(
 			klog.Errorf("Failed to create directory %q: %v", podLogsRootDirectory, err)
 		}
 	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletCredentialProviders) && (imageCredentialProviderConfigFile != "" || imageCredentialProviderBinDir != "") {
+		klog.Warningf("Flags --image-credential-provider-config or --image-credential-provider-bin-dir were set but the feature gate %s was disabled, these flags will be ignored",
+			features.KubeletCredentialProviders)
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletCredentialProviders) && (imageCredentialProviderConfigFile != "" || imageCredentialProviderBinDir != "") {
+		if err := plugin.RegisterCredentialProviderPlugins(imageCredentialProviderConfigFile, imageCredentialProviderBinDir); err != nil {
+			klog.Fatalf("Failed to register CRI auth plugins: %v", err)
+		}
+	}
+	kubeRuntimeManager.keyring = credentialprovider.NewDockerKeyring()
 
 	kubeRuntimeManager.imagePuller = images.NewImageManager(
 		kubecontainer.FilterEventRecorder(recorder),
@@ -268,17 +285,15 @@ func newRuntimeVersion(version string) (*utilversion.Version, error) {
 func (m *kubeGenericRuntimeManager) getTypedVersion() (*runtimeapi.VersionResponse, error) {
 	typedVersion, err := m.runtimeService.Version(kubeRuntimeAPIVersion)
 	if err != nil {
-		klog.Errorf("Get remote runtime typed version failed: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("get remote runtime typed version failed: %v", err)
 	}
 	return typedVersion, nil
 }
 
 // Version returns the version information of the container runtime.
 func (m *kubeGenericRuntimeManager) Version() (kubecontainer.Version, error) {
-	typedVersion, err := m.runtimeService.Version(kubeRuntimeAPIVersion)
+	typedVersion, err := m.getTypedVersion()
 	if err != nil {
-		klog.Errorf("Get remote runtime version failed: %v", err)
 		return nil, err
 	}
 
@@ -458,7 +473,7 @@ func (m *kubeGenericRuntimeManager) podSandboxChanged(pod *v1.Pod, podStatus *ku
 	return false, sandboxStatus.Metadata.Attempt, sandboxStatus.Id
 }
 
-func containerChanged(container *v1.Container, containerStatus *kubecontainer.ContainerStatus) (uint64, uint64, bool) {
+func containerChanged(container *v1.Container, containerStatus *kubecontainer.Status) (uint64, uint64, bool) {
 	expectedHash := kubecontainer.HashContainer(container)
 	return expectedHash, containerStatus.Hash, containerStatus.Hash != expectedHash
 }
@@ -504,19 +519,30 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 			changes.CreateSandbox = false
 			return changes
 		}
+
+		// Get the containers to start, excluding the ones that succeeded if RestartPolicy is OnFailure.
+		var containersToStart []int
+		for idx, c := range pod.Spec.Containers {
+			if pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure && containerSucceeded(&c, podStatus) {
+				continue
+			}
+			containersToStart = append(containersToStart, idx)
+		}
+		// We should not create a sandbox for a Pod if initialization is done and there is no container to start.
+		if len(containersToStart) == 0 {
+			_, _, done := findNextInitContainerToRun(pod, podStatus)
+			if done {
+				changes.CreateSandbox = false
+				return changes
+			}
+		}
+
 		if len(pod.Spec.InitContainers) != 0 {
 			// Pod has init containers, return the first one.
 			changes.NextInitContainerToStart = &pod.Spec.InitContainers[0]
 			return changes
 		}
-		// Start all containers by default but exclude the ones that succeeded if
-		// RestartPolicy is OnFailure.
-		for idx, c := range pod.Spec.Containers {
-			if containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure {
-				continue
-			}
-			changes.ContainersToStart = append(changes.ContainersToStart, idx)
-		}
+		changes.ContainersToStart = containersToStart
 		return changes
 	}
 
@@ -577,7 +603,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// need to restart it.
 		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
 			if kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus) {
-				message := fmt.Sprintf("Container %+v is dead, but RestartPolicy says that we should restart it.", container)
+				message := fmt.Sprintf("Container %q of pod %q is not in the desired state and shall be started", container.Name, format.Pod(pod))
 				klog.V(3).Infof(message)
 				changes.ContainersToStart = append(changes.ContainersToStart, idx)
 				if containerStatus != nil && containerStatus.State == kubecontainer.ContainerStateUnknown {
@@ -720,7 +746,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		var msg string
 		var err error
 
-		klog.V(4).Infof("Creating sandbox for pod %q", format.Pod(pod))
+		klog.V(4).Infof("Creating PodSandbox for pod %q", format.Pod(pod))
 		createSandboxResult := kubecontainer.NewSyncResult(kubecontainer.CreatePodSandbox, format.Pod(pod))
 		result.AddSyncResult(createSandboxResult)
 		podSandboxID, msg, err = m.createPodSandbox(pod, podContainerChanges.Attempt)
@@ -779,28 +805,28 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 	// Helper containing boilerplate common to starting all types of containers.
 	// typeName is a label used to describe this type of container in log messages,
 	// currently: "container", "init container" or "ephemeral container"
-	start := func(typeName string, container *v1.Container) error {
-		startContainerResult := kubecontainer.NewSyncResult(kubecontainer.StartContainer, container.Name)
+	start := func(typeName string, spec *startSpec) error {
+		startContainerResult := kubecontainer.NewSyncResult(kubecontainer.StartContainer, spec.container.Name)
 		result.AddSyncResult(startContainerResult)
 
-		isInBackOff, msg, err := m.doBackOff(pod, container, podStatus, backOff)
+		isInBackOff, msg, err := m.doBackOff(pod, spec.container, podStatus, backOff)
 		if isInBackOff {
 			startContainerResult.Fail(err, msg)
-			klog.V(4).Infof("Backing Off restarting %v %+v in pod %v", typeName, container, format.Pod(pod))
+			klog.V(4).Infof("Backing Off restarting %v %+v in pod %v", typeName, spec.container, format.Pod(pod))
 			return err
 		}
 
-		klog.V(4).Infof("Creating %v %+v in pod %v", typeName, container, format.Pod(pod))
+		klog.V(4).Infof("Creating %v %+v in pod %v", typeName, spec.container, format.Pod(pod))
 		// NOTE (aramase) podIPs are populated for single stack and dual stack clusters. Send only podIPs.
-		if msg, err := m.startContainer(podSandboxID, podSandboxConfig, container, pod, podStatus, pullSecrets, podIP, podIPs); err != nil {
+		if msg, err := m.startContainer(podSandboxID, podSandboxConfig, spec, pod, podStatus, pullSecrets, podIP, podIPs); err != nil {
 			startContainerResult.Fail(err, msg)
 			// known errors that are logged in other places are logged at higher levels here to avoid
 			// repetitive log spam
 			switch {
 			case err == images.ErrImagePullBackOff:
-				klog.V(3).Infof("%v start failed: %v: %s", typeName, err, msg)
+				klog.V(3).Infof("%v %+v start failed in pod %v: %v: %s", typeName, spec.container, format.Pod(pod), err, msg)
 			default:
-				utilruntime.HandleError(fmt.Errorf("%v start failed: %v: %s", typeName, err, msg))
+				utilruntime.HandleError(fmt.Errorf("%v %+v start failed in pod %v: %v: %s", typeName, spec.container, format.Pod(pod), err, msg))
 			}
 			return err
 		}
@@ -814,15 +840,14 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 	// containers cannot be specified on pod creation.
 	if utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
 		for _, idx := range podContainerChanges.EphemeralContainersToStart {
-			c := (*v1.Container)(&pod.Spec.EphemeralContainers[idx].EphemeralContainerCommon)
-			start("ephemeral container", c)
+			start("ephemeral container", ephemeralContainerStartSpec(&pod.Spec.EphemeralContainers[idx]))
 		}
 	}
 
 	// Step 6: start the init container.
 	if container := podContainerChanges.NextInitContainerToStart; container != nil {
 		// Start the next init container.
-		if err := start("init container", container); err != nil {
+		if err := start("init container", containerStartSpec(container)); err != nil {
 			return
 		}
 
@@ -832,7 +857,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 
 	// Step 7: start containers in podContainerChanges.ContainersToStart.
 	for _, idx := range podContainerChanges.ContainersToStart {
-		start("container", &pod.Spec.Containers[idx])
+		start("container", containerStartSpec(&pod.Spec.Containers[idx]))
 	}
 
 	return
@@ -841,7 +866,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 // If a container is still in backoff, the function will return a brief backoff error and
 // a detailed error message.
 func (m *kubeGenericRuntimeManager) doBackOff(pod *v1.Pod, container *v1.Container, podStatus *kubecontainer.PodStatus, backOff *flowcontrol.Backoff) (bool, string, error) {
-	var cStatus *kubecontainer.ContainerStatus
+	var cStatus *kubecontainer.Status
 	for _, c := range podStatus.ContainerStatuses {
 		if c.Name == container.Name && c.State == kubecontainer.ContainerStateExited {
 			cStatus = c
@@ -969,7 +994,7 @@ func (m *kubeGenericRuntimeManager) GetPodStatus(uid kubetypes.UID, name, namesp
 }
 
 // GarbageCollect removes dead containers using the specified container gc policy.
-func (m *kubeGenericRuntimeManager) GarbageCollect(gcPolicy kubecontainer.ContainerGCPolicy, allSourcesReady bool, evictNonDeletedPods bool) error {
+func (m *kubeGenericRuntimeManager) GarbageCollect(gcPolicy kubecontainer.GCPolicy, allSourcesReady bool, evictNonDeletedPods bool) error {
 	return m.containerGC.GarbageCollect(gcPolicy, allSourcesReady, evictNonDeletedPods)
 }
 

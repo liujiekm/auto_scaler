@@ -23,13 +23,11 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/klog"
-	"k8s.io/utils/mount"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 )
@@ -134,6 +132,7 @@ func (attacher *fcAttacher) MountDevice(spec *volume.Spec, devicePath string, de
 type fcDetacher struct {
 	mounter mount.Interface
 	manager diskManager
+	host    volume.VolumeHost
 }
 
 var _ volume.Detacher = &fcDetacher{}
@@ -144,6 +143,7 @@ func (plugin *fcPlugin) NewDetacher() (volume.Detacher, error) {
 	return &fcDetacher{
 		mounter: plugin.host.GetMounter(plugin.GetPluginName()),
 		manager: &fcUtil{},
+		host:    plugin.host,
 	}, nil
 }
 
@@ -167,7 +167,12 @@ func (detacher *fcDetacher) UnmountDevice(deviceMountPath string) error {
 	if err != nil {
 		return fmt.Errorf("fc: failed to unmount: %s\nError: %v", deviceMountPath, err)
 	}
-	unMounter := volumeSpecToUnmounter(detacher.mounter)
+	// GetDeviceNameFromMount from above returns an empty string if deviceMountPath is not a mount point
+	// There is no need to DetachDisk if this is the case (and DetachDisk will throw an error if we attempt)
+	if devName == "" {
+		return nil
+	}
+	unMounter := volumeSpecToUnmounter(detacher.mounter, detacher.host)
 	err = detacher.manager.DetachDisk(*unMounter, devName)
 	if err != nil {
 		return fmt.Errorf("fc: failed to detach disk: %s\nError: %v", devName, err)
@@ -209,37 +214,31 @@ func volumeSpecToMounter(spec *volume.Spec, host volume.VolumeHost) (*fcDiskMoun
 		wwids: wwids,
 		io:    &osIOHandler{},
 	}
-	// TODO: remove feature gate check after no longer needed
-	if utilfeature.DefaultFeatureGate.Enabled(features.BlockVolume) {
-		volumeMode, err := volumeutil.GetVolumeMode(spec)
-		if err != nil {
-			return nil, err
-		}
-		klog.V(5).Infof("fc: volumeSpecToMounter volumeMode %s", volumeMode)
-		return &fcDiskMounter{
-			fcDisk:     fcDisk,
-			fsType:     fc.FSType,
-			volumeMode: volumeMode,
-			readOnly:   readOnly,
-			mounter:    volumeutil.NewSafeFormatAndMountFromHost(fcPluginName, host),
-			deviceUtil: volumeutil.NewDeviceHandler(volumeutil.NewIOHandler()),
-		}, nil
+
+	volumeMode, err := volumeutil.GetVolumeMode(spec)
+	if err != nil {
+		return nil, err
 	}
+
+	klog.V(5).Infof("fc: volumeSpecToMounter volumeMode %s", volumeMode)
 	return &fcDiskMounter{
-		fcDisk:     fcDisk,
-		fsType:     fc.FSType,
-		readOnly:   readOnly,
-		mounter:    volumeutil.NewSafeFormatAndMountFromHost(fcPluginName, host),
-		deviceUtil: volumeutil.NewDeviceHandler(volumeutil.NewIOHandler()),
+		fcDisk:       fcDisk,
+		fsType:       fc.FSType,
+		volumeMode:   volumeMode,
+		readOnly:     readOnly,
+		mounter:      volumeutil.NewSafeFormatAndMountFromHost(fcPluginName, host),
+		deviceUtil:   volumeutil.NewDeviceHandler(volumeutil.NewIOHandler()),
+		mountOptions: volumeutil.MountOptionFromSpec(spec),
 	}, nil
 }
 
-func volumeSpecToUnmounter(mounter mount.Interface) *fcDiskUnmounter {
+func volumeSpecToUnmounter(mounter mount.Interface, host volume.VolumeHost) *fcDiskUnmounter {
 	return &fcDiskUnmounter{
 		fcDisk: &fcDisk{
 			io: &osIOHandler{},
 		},
 		mounter:    mounter,
 		deviceUtil: volumeutil.NewDeviceHandler(volumeutil.NewIOHandler()),
+		exec:       host.GetExec(fcPluginName),
 	}
 }

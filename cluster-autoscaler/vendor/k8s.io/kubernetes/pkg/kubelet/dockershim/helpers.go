@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -29,14 +31,14 @@ import (
 	dockercontainer "github.com/docker/docker/api/types/container"
 	dockerfilters "github.com/docker/docker/api/types/filters"
 	dockernat "github.com/docker/go-connections/nat"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
+	v1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/credentialprovider"
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
 	"k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/security/apparmor"
 	"k8s.io/kubernetes/pkg/util/parsers"
 )
 
@@ -52,7 +54,7 @@ var (
 	// if a container starts but the executable file is not found, runc gives a message that matches
 	startRE = regexp.MustCompile(`\\\\\\\"(.*)\\\\\\\": executable file not found`)
 
-	defaultSeccompOpt = []dockerOpt{{"seccomp", "unconfined", ""}}
+	defaultSeccompOpt = []dockerOpt{{"seccomp", v1.SeccompProfileNameUnconfined, ""}}
 )
 
 // generateEnvList converts KeyValue list to a list of strings, in the form of
@@ -287,15 +289,15 @@ func recoverFromCreationConflictIfNeeded(client libdocker.Interface, createConfi
 
 	id := matches[1]
 	klog.Warningf("Unable to create pod sandbox due to conflict. Attempting to remove sandbox %q", id)
-	if rmErr := client.RemoveContainer(id, dockertypes.ContainerRemoveOptions{RemoveVolumes: true}); rmErr == nil {
+	rmErr := client.RemoveContainer(id, dockertypes.ContainerRemoveOptions{RemoveVolumes: true})
+	if rmErr == nil {
 		klog.V(2).Infof("Successfully removed conflicting container %q", id)
 		return nil, err
-	} else {
-		klog.Errorf("Failed to remove the conflicting container %q: %v", id, rmErr)
-		// Return if the error is not container not found error.
-		if !libdocker.IsContainerNotFoundError(rmErr) {
-			return nil, err
-		}
+	}
+	klog.Errorf("Failed to remove the conflicting container %q: %v", id, rmErr)
+	// Return if the error is not container not found error.
+	if !libdocker.IsContainerNotFoundError(rmErr) {
+		return nil, err
 	}
 
 	// randomize the name to avoid conflict.
@@ -361,18 +363,18 @@ func ensureSandboxImageExists(client libdocker.Interface, image string) error {
 }
 
 func getAppArmorOpts(profile string) ([]dockerOpt, error) {
-	if profile == "" || profile == apparmor.ProfileRuntimeDefault {
+	if profile == "" || profile == v1.AppArmorBetaProfileRuntimeDefault {
 		// The docker applies the default profile by default.
 		return nil, nil
 	}
 
 	// Return unconfined profile explicitly
-	if profile == apparmor.ProfileNameUnconfined {
-		return []dockerOpt{{"apparmor", apparmor.ProfileNameUnconfined, ""}}, nil
+	if profile == v1.AppArmorBetaProfileNameUnconfined {
+		return []dockerOpt{{"apparmor", v1.AppArmorBetaProfileNameUnconfined, ""}}, nil
 	}
 
 	// Assume validation has already happened.
-	profileName := strings.TrimPrefix(profile, apparmor.ProfileNamePrefix)
+	profileName := strings.TrimPrefix(profile, v1.AppArmorBetaProfileNamePrefix)
 	return []dockerOpt{{"apparmor", profileName, ""}}, nil
 }
 

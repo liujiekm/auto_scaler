@@ -21,25 +21,24 @@ import (
 	"net"
 	"runtime"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-	"k8s.io/utils/mount"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
-	storagelisters "k8s.io/client-go/listers/storage/v1beta1"
+	storagelisters "k8s.io/client-go/listers/storage/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/configmap"
 	"k8s.io/kubernetes/pkg/kubelet/secret"
 	"k8s.io/kubernetes/pkg/kubelet/token"
+	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
@@ -65,17 +64,15 @@ func NewInitializedVolumePluginMgr(
 	var csiDriverLister storagelisters.CSIDriverLister
 	var csiDriversSynced cache.InformerSynced
 	const resyncPeriod = 0
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSIDriverRegistry) {
-		// Don't initialize if kubeClient is nil
-		if kubelet.kubeClient != nil {
-			informerFactory = informers.NewSharedInformerFactory(kubelet.kubeClient, resyncPeriod)
-			csiDriverInformer := informerFactory.Storage().V1beta1().CSIDrivers()
-			csiDriverLister = csiDriverInformer.Lister()
-			csiDriversSynced = csiDriverInformer.Informer().HasSynced
+	// Don't initialize if kubeClient is nil
+	if kubelet.kubeClient != nil {
+		informerFactory = informers.NewSharedInformerFactory(kubelet.kubeClient, resyncPeriod)
+		csiDriverInformer := informerFactory.Storage().V1().CSIDrivers()
+		csiDriverLister = csiDriverInformer.Lister()
+		csiDriversSynced = csiDriverInformer.Informer().HasSynced
 
-		} else {
-			klog.Warning("kubeClient is nil. Skip initialization of CSIDriverLister")
-		}
+	} else {
+		klog.Warning("kubeClient is nil. Skip initialization of CSIDriverLister")
 	}
 
 	kvh := &kubeletVolumeHost{
@@ -155,6 +152,11 @@ func (kvh *kubeletVolumeHost) GetSubpather() subpath.Interface {
 	return kvh.kubelet.subpather
 }
 
+func (kvh *kubeletVolumeHost) GetFilteredDialOptions() *proxyutil.FilteredDialOptions {
+	// FilteredDial is not needed in the kubelet.
+	return nil
+}
+
 func (kvh *kubeletVolumeHost) GetHostUtil() hostutil.HostUtils {
 	return kvh.kubelet.hostutil
 }
@@ -229,7 +231,11 @@ func (kvh *kubeletVolumeHost) GetHostName() string {
 }
 
 func (kvh *kubeletVolumeHost) GetHostIP() (net.IP, error) {
-	return kvh.kubelet.GetHostIP()
+	hostIPs, err := kvh.kubelet.GetHostIPs()
+	if err != nil {
+		return nil, err
+	}
+	return hostIPs[0], err
 }
 
 func (kvh *kubeletVolumeHost) GetNodeAllocatable() (v1.ResourceList, error) {

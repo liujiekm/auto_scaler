@@ -6,10 +6,10 @@ go_library(
     importpath = "k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodepreferavoidpods",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/scheduler/algorithm/priorities:go_default_library",
-        "//pkg/scheduler/framework/plugins/migration:go_default_library",
-        "//pkg/scheduler/framework/v1alpha1:go_default_library",
+        "//pkg/apis/core/v1/helper:go_default_library",
+        "//pkg/scheduler/framework:go_default_library",
         "//staging/src/k8s.io/api/core/v1:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
         "//staging/src/k8s.io/apimachinery/pkg/runtime:go_default_library",
     ],
 )
@@ -19,8 +19,9 @@ go_test(
     srcs = ["node_prefer_avoid_pods_test.go"],
     embed = [":go_default_library"],
     deps = [
-        "//pkg/scheduler/framework/v1alpha1:go_default_library",
-        "//pkg/scheduler/nodeinfo/snapshot:go_default_library",
+        "//pkg/scheduler/framework:go_default_library",
+        "//pkg/scheduler/framework/runtime:go_default_library",
+        "//pkg/scheduler/internal/cache:go_default_library",
         "//staging/src/k8s.io/api/core/v1:go_default_library",
         "//staging/src/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
     ],

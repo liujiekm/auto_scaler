@@ -27,10 +27,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute"
 	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -39,19 +38,43 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/pkg/version"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/flowcontrol"
 	cloudprovider "k8s.io/cloud-provider"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/legacy-cloud-providers/azure/auth"
+	azcache "k8s.io/legacy-cloud-providers/azure/cache"
+	azclients "k8s.io/legacy-cloud-providers/azure/clients"
+	"k8s.io/legacy-cloud-providers/azure/clients/diskclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/fileclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/interfaceclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/loadbalancerclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/publicipclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/routeclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/routetableclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/securitygroupclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/snapshotclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/storageaccountclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/subnetclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/vmclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/vmsizeclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/vmssclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/vmssvmclient"
+	"k8s.io/legacy-cloud-providers/azure/retry"
+
+	// ensure the newly added package from azure-sdk-for-go is in vendor/
+	_ "k8s.io/legacy-cloud-providers/azure/clients/containerserviceclient"
+	// ensure the newly added package from azure-sdk-for-go is in vendor/
+	_ "k8s.io/legacy-cloud-providers/azure/clients/deploymentclient"
+
 	"sigs.k8s.io/yaml"
 )
 
 const (
 	// CloudProviderName is the value used for the --cloud-provider flag
-	CloudProviderName      = "azure"
+	CloudProviderName = "azure"
+	// AzureStackCloudName is the cloud name of Azure Stack
+	AzureStackCloudName    = "AZURESTACKCLOUD"
 	rateLimitQPSDefault    = 1.0
 	rateLimitBucketDefault = 5
 	backoffRetriesDefault  = 6
@@ -64,14 +87,28 @@ const (
 	vmTypeVMSS     = "vmss"
 	vmTypeStandard = "standard"
 
-	backoffModeDefault = "default"
-	backoffModeV2      = "v2"
-
 	loadBalancerSkuBasic    = "basic"
 	loadBalancerSkuStandard = "standard"
 
 	externalResourceGroupLabel = "kubernetes.azure.com/resource-group"
 	managedByAzureLabel        = "kubernetes.azure.com/managed"
+
+	// LabelFailureDomainBetaZone refer to https://github.com/kubernetes/api/blob/8519c5ea46199d57724725d5b969c5e8e0533692/core/v1/well_known_labels.go#L22-L23
+	LabelFailureDomainBetaZone = "failure-domain.beta.kubernetes.io/zone"
+
+	// LabelFailureDomainBetaRegion failure-domain region label
+	LabelFailureDomainBetaRegion = "failure-domain.beta.kubernetes.io/region"
+)
+
+const (
+	// PreConfiguredBackendPoolLoadBalancerTypesNone means that the load balancers are not pre-configured
+	PreConfiguredBackendPoolLoadBalancerTypesNone = ""
+	// PreConfiguredBackendPoolLoadBalancerTypesInternal means that the `internal` load balancers are pre-configured
+	PreConfiguredBackendPoolLoadBalancerTypesInternal = "internal"
+	// PreConfiguredBackendPoolLoadBalancerTypesExternal means that the `external` load balancers are pre-configured
+	PreConfiguredBackendPoolLoadBalancerTypesExternal = "external"
+	// PreConfiguredBackendPoolLoadBalancerTypesAll means that all load balancers are pre-configured
+	PreConfiguredBackendPoolLoadBalancerTypesAll = "all"
 )
 
 var (
@@ -90,6 +127,7 @@ var (
 // for more details.
 type Config struct {
 	auth.AzureAuthConfig
+	CloudProviderRateLimitConfig
 
 	// The name of the resource group that the cluster is deployed in
 	ResourceGroup string `json:"resourceGroup,omitempty" yaml:"resourceGroup,omitempty"`
@@ -103,6 +141,8 @@ type Config struct {
 	SubnetName string `json:"subnetName,omitempty" yaml:"subnetName,omitempty"`
 	// The name of the security group attached to the cluster's subnet
 	SecurityGroupName string `json:"securityGroupName,omitempty" yaml:"securityGroupName,omitempty"`
+	// The name of the resource group that the security group is deployed in
+	SecurityGroupResourceGroup string `json:"securityGroupResourceGroup,omitempty" yaml:"securityGroupResourceGroup,omitempty"`
 	// (Optional in 1.6) The name of the route table attached to the subnet that the cluster is deployed in
 	RouteTableName string `json:"routeTableName,omitempty" yaml:"routeTableName,omitempty"`
 	// The name of the resource group that the RouteTable is deployed in
@@ -132,23 +172,6 @@ type Config struct {
 	CloudProviderBackoffDuration int `json:"cloudProviderBackoffDuration,omitempty" yaml:"cloudProviderBackoffDuration,omitempty"`
 	// Backoff jitter
 	CloudProviderBackoffJitter float64 `json:"cloudProviderBackoffJitter,omitempty" yaml:"cloudProviderBackoffJitter,omitempty"`
-	// Backoff mode, options are v2 and default.
-	// * default means two-layer backoff retrying, one in the cloud provider and the other in the Azure SDK.
-	// * v2 means only backoff in the Azure SDK is used. In such mode, CloudProviderBackoffDuration and
-	//   CloudProviderBackoffJitter are omitted.
-	// "default" will be used if not specified.
-	CloudProviderBackoffMode string `json:"cloudProviderBackoffMode,omitempty" yaml:"cloudProviderBackoffMode,omitempty"`
-	// Enable rate limiting
-	CloudProviderRateLimit bool `json:"cloudProviderRateLimit,omitempty" yaml:"cloudProviderRateLimit,omitempty"`
-	// Rate limit QPS (Read)
-	CloudProviderRateLimitQPS float32 `json:"cloudProviderRateLimitQPS,omitempty" yaml:"cloudProviderRateLimitQPS,omitempty"`
-	// Rate limit Bucket Size
-	CloudProviderRateLimitBucket int `json:"cloudProviderRateLimitBucket,omitempty" yaml:"cloudProviderRateLimitBucket,omitempty"`
-	// Rate limit QPS (Write)
-	CloudProviderRateLimitQPSWrite float32 `json:"cloudProviderRateLimitQPSWrite,omitempty" yaml:"cloudProviderRateLimitQPSWrite,omitempty"`
-	// Rate limit Bucket Size
-	CloudProviderRateLimitBucketWrite int `json:"cloudProviderRateLimitBucketWrite,omitempty" yaml:"cloudProviderRateLimitBucketWrite,omitempty"`
-
 	// Use instance metadata service where possible
 	UseInstanceMetadata bool `json:"useInstanceMetadata,omitempty" yaml:"useInstanceMetadata,omitempty"`
 
@@ -174,39 +197,83 @@ type Config struct {
 	// LoadBalancerResourceGroup determines the specific resource group of the load balancer user want to use, working
 	// with LoadBalancerName
 	LoadBalancerResourceGroup string `json:"loadBalancerResourceGroup,omitempty" yaml:"loadBalancerResourceGroup,omitempty"`
+	// PreConfiguredBackendPoolLoadBalancerTypes determines whether the LoadBalancer BackendPool has been preconfigured.
+	// Candidate values are:
+	//   "": exactly with today (not pre-configured for any LBs)
+	//   "internal": for internal LoadBalancer
+	//   "external": for external LoadBalancer
+	//   "all": for both internal and external LoadBalancer
+	PreConfiguredBackendPoolLoadBalancerTypes string `json:"preConfiguredBackendPoolLoadBalancerTypes,omitempty" yaml:"preConfiguredBackendPoolLoadBalancerTypes,omitempty"`
+	// EnableMultipleStandardLoadBalancers determines the behavior of the standard load balancer. If set to true
+	// there would be one standard load balancer per VMAS or VMSS, which is similar with the behavior of the basic
+	// load balancer. Users could select the specific standard load balancer for their service by the service
+	// annotation `service.beta.kubernetes.io/azure-load-balancer-mode`, If set to false, the same standard load balancer
+	// would be shared by all services in the cluster. In this case, the mode selection annotation would be ignored.
+	EnableMultipleStandardLoadBalancers bool `json:"enableMultipleStandardLoadBalancers,omitempty" yaml:"enableMultipleStandardLoadBalancers,omitempty"`
+
+	// AvailabilitySetNodesCacheTTLInSeconds sets the Cache TTL for availabilitySetNodesCache
+	// if not set, will use default value
+	AvailabilitySetNodesCacheTTLInSeconds int `json:"availabilitySetNodesCacheTTLInSeconds,omitempty" yaml:"availabilitySetNodesCacheTTLInSeconds,omitempty"`
+	// VmssCacheTTLInSeconds sets the cache TTL for VMSS
+	VmssCacheTTLInSeconds int `json:"vmssCacheTTLInSeconds,omitempty" yaml:"vmssCacheTTLInSeconds,omitempty"`
+	// VmssVirtualMachinesCacheTTLInSeconds sets the cache TTL for vmssVirtualMachines
+	VmssVirtualMachinesCacheTTLInSeconds int `json:"vmssVirtualMachinesCacheTTLInSeconds,omitempty" yaml:"vmssVirtualMachinesCacheTTLInSeconds,omitempty"`
+	// VmCacheTTLInSeconds sets the cache TTL for vm
+	VMCacheTTLInSeconds int `json:"vmCacheTTLInSeconds,omitempty" yaml:"vmCacheTTLInSeconds,omitempty"`
+	// LoadBalancerCacheTTLInSeconds sets the cache TTL for load balancer
+	LoadBalancerCacheTTLInSeconds int `json:"loadBalancerCacheTTLInSeconds,omitempty" yaml:"loadBalancerCacheTTLInSeconds,omitempty"`
+	// NsgCacheTTLInSeconds sets the cache TTL for network security group
+	NsgCacheTTLInSeconds int `json:"nsgCacheTTLInSeconds,omitempty" yaml:"nsgCacheTTLInSeconds,omitempty"`
+	// RouteTableCacheTTLInSeconds sets the cache TTL for route table
+	RouteTableCacheTTLInSeconds int `json:"routeTableCacheTTLInSeconds,omitempty" yaml:"routeTableCacheTTLInSeconds,omitempty"`
+
+	// DisableAvailabilitySetNodes disables VMAS nodes support when "VMType" is set to "vmss".
+	DisableAvailabilitySetNodes bool `json:"disableAvailabilitySetNodes,omitempty" yaml:"disableAvailabilitySetNodes,omitempty"`
+
+	// Tags determines what tags shall be applied to the shared resources managed by controller manager, which
+	// includes load balancer, security group and route table. The supported format is `a=b,c=d,...`. After updated
+	// this config, the old tags would be replaced by the new ones.
+	Tags string `json:"tags,omitempty" yaml:"tags,omitempty"`
 }
 
-var _ cloudprovider.Interface = (*Cloud)(nil)
-var _ cloudprovider.Instances = (*Cloud)(nil)
-var _ cloudprovider.LoadBalancer = (*Cloud)(nil)
-var _ cloudprovider.Routes = (*Cloud)(nil)
-var _ cloudprovider.Zones = (*Cloud)(nil)
-var _ cloudprovider.PVLabeler = (*Cloud)(nil)
+var (
+	_ cloudprovider.Interface    = (*Cloud)(nil)
+	_ cloudprovider.Instances    = (*Cloud)(nil)
+	_ cloudprovider.LoadBalancer = (*Cloud)(nil)
+	_ cloudprovider.Routes       = (*Cloud)(nil)
+	_ cloudprovider.Zones        = (*Cloud)(nil)
+	_ cloudprovider.PVLabeler    = (*Cloud)(nil)
+)
 
 // Cloud holds the config and clients
 type Cloud struct {
 	Config
-	Environment             azure.Environment
-	RoutesClient            RoutesClient
-	SubnetsClient           SubnetsClient
-	InterfacesClient        InterfacesClient
-	RouteTablesClient       RouteTablesClient
-	LoadBalancerClient      LoadBalancersClient
-	PublicIPAddressesClient PublicIPAddressesClient
-	SecurityGroupsClient    SecurityGroupsClient
-	VirtualMachinesClient   VirtualMachinesClient
-	StorageAccountClient    StorageAccountClient
-	DisksClient             DisksClient
-	SnapshotsClient         *compute.SnapshotsClient
-	FileClient              FileClient
-	ResourceRequestBackoff  wait.Backoff
-	metadata                *InstanceMetadataService
-	vmSet                   VMSet
+	Environment azure.Environment
+
+	RoutesClient                    routeclient.Interface
+	SubnetsClient                   subnetclient.Interface
+	InterfacesClient                interfaceclient.Interface
+	RouteTablesClient               routetableclient.Interface
+	LoadBalancerClient              loadbalancerclient.Interface
+	PublicIPAddressesClient         publicipclient.Interface
+	SecurityGroupsClient            securitygroupclient.Interface
+	VirtualMachinesClient           vmclient.Interface
+	StorageAccountClient            storageaccountclient.Interface
+	DisksClient                     diskclient.Interface
+	SnapshotsClient                 snapshotclient.Interface
+	FileClient                      fileclient.Interface
+	VirtualMachineScaleSetsClient   vmssclient.Interface
+	VirtualMachineScaleSetVMsClient vmssvmclient.Interface
+	VirtualMachineSizesClient       vmsizeclient.Interface
+
+	ResourceRequestBackoff wait.Backoff
+	metadata               *InstanceMetadataService
+	VMSet                  VMSet
 
 	// ipv6DualStack allows overriding for unit testing.  It's normally initialized from featuregates
 	ipv6DualStackEnabled bool
 	// Lock for access to node caches, includes nodeZones, nodeResourceGroups, and unmanagedNodes.
-	nodeCachesLock sync.Mutex
+	nodeCachesLock sync.RWMutex
 	// nodeZones is a mapping from Zone to a sets.String of Node's names in the Zone
 	// it is updated by the nodeInformer
 	nodeZones map[string]sets.String
@@ -222,22 +289,15 @@ type Cloud struct {
 	// routeCIDRs holds cache for route CIDRs.
 	routeCIDRs map[string]string
 
-	// Clients for vmss.
-	VirtualMachineScaleSetsClient   VirtualMachineScaleSetsClient
-	VirtualMachineScaleSetVMsClient VirtualMachineScaleSetVMsClient
-
-	// client for vm sizes list
-	VirtualMachineSizesClient VirtualMachineSizesClient
-
-	kubeClient       clientset.Interface
+	KubeClient       clientset.Interface
 	eventBroadcaster record.EventBroadcaster
 	eventRecorder    record.EventRecorder
 	routeUpdater     *delayedRouteUpdater
 
-	vmCache  *timedCache
-	lbCache  *timedCache
-	nsgCache *timedCache
-	rtCache  *timedCache
+	vmCache  *azcache.TimedCache
+	lbCache  *azcache.TimedCache
+	nsgCache *azcache.TimedCache
+	rtCache  *azcache.TimedCache
 
 	*BlobDiskController
 	*ManagedDiskController
@@ -308,9 +368,17 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 		config.RouteTableResourceGroup = config.ResourceGroup
 	}
 
+	if config.SecurityGroupResourceGroup == "" {
+		config.SecurityGroupResourceGroup = config.ResourceGroup
+	}
+
 	if config.VMType == "" {
 		// default to standard vmType if not set.
 		config.VMType = vmTypeStandard
+	}
+
+	if config.DisableAvailabilitySetNodes && config.VMType != vmTypeVMSS {
+		return fmt.Errorf("disableAvailabilitySetNodes %v is only supported when vmType is 'vmss'", config.DisableAvailabilitySetNodes)
 	}
 
 	if config.CloudConfigType == "" {
@@ -326,7 +394,7 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 		}
 	}
 
-	env, err := auth.ParseAzureEnvironment(config.Cloud)
+	env, err := auth.ParseAzureEnvironment(config.Cloud, config.ResourceManagerEndpoint, config.IdentitySystem)
 	if err != nil {
 		return err
 	}
@@ -335,7 +403,7 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 	if err == auth.ErrorNoAuth {
 		// Only controller-manager would lazy-initialize from secret, and credentials are required for such case.
 		if fromSecret {
-			err := fmt.Errorf("No credentials provided for Azure cloud provider")
+			err := fmt.Errorf("no credentials provided for Azure cloud provider")
 			klog.Fatalf("%v", err)
 			return err
 		}
@@ -343,7 +411,7 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 		// No credentials provided, useInstanceMetadata should be enabled for Kubelet.
 		// TODO(feiskyer): print different error message for Kubelet and controller-manager, as they're
 		// requiring different credential settings.
-		if !config.UseInstanceMetadata && az.Config.CloudConfigType == cloudConfigTypeFile {
+		if !config.UseInstanceMetadata && config.CloudConfigType == cloudConfigTypeFile {
 			return fmt.Errorf("useInstanceMetadata must be enabled without Azure credentials")
 		}
 
@@ -352,43 +420,8 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 		return err
 	}
 
-	// operationPollRateLimiter.Accept() is a no-op if rate limits are configured off.
-	operationPollRateLimiter := flowcontrol.NewFakeAlwaysRateLimiter()
-	operationPollRateLimiterWrite := flowcontrol.NewFakeAlwaysRateLimiter()
-
-	// If reader is provided (and no writer) we will
-	// use the same value for both.
-	if config.CloudProviderRateLimit {
-		// Assign rate limit defaults if no configuration was passed in
-		if config.CloudProviderRateLimitQPS == 0 {
-			config.CloudProviderRateLimitQPS = rateLimitQPSDefault
-		}
-		if config.CloudProviderRateLimitBucket == 0 {
-			config.CloudProviderRateLimitBucket = rateLimitBucketDefault
-		}
-		if config.CloudProviderRateLimitQPSWrite == 0 {
-			config.CloudProviderRateLimitQPSWrite = rateLimitQPSDefault
-		}
-		if config.CloudProviderRateLimitBucketWrite == 0 {
-			config.CloudProviderRateLimitBucketWrite = rateLimitBucketDefault
-		}
-
-		operationPollRateLimiter = flowcontrol.NewTokenBucketRateLimiter(
-			config.CloudProviderRateLimitQPS,
-			config.CloudProviderRateLimitBucket)
-
-		operationPollRateLimiterWrite = flowcontrol.NewTokenBucketRateLimiter(
-			config.CloudProviderRateLimitQPSWrite,
-			config.CloudProviderRateLimitBucketWrite)
-
-		klog.V(2).Infof("Azure cloudprovider (read ops) using rate limit config: QPS=%g, bucket=%d",
-			config.CloudProviderRateLimitQPS,
-			config.CloudProviderRateLimitBucket)
-
-		klog.V(2).Infof("Azure cloudprovider (write ops) using rate limit config: QPS=%g, bucket=%d",
-			config.CloudProviderRateLimitQPSWrite,
-			config.CloudProviderRateLimitBucketWrite)
-	}
+	// Initialize rate limiting config options.
+	InitializeCloudProviderRateLimitConfig(&config.CloudProviderRateLimitConfig)
 
 	// Conditionally configure resource request backoff
 	resourceRequestBackoff := wait.Backoff{
@@ -404,22 +437,17 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 		}
 		if config.CloudProviderBackoffExponent == 0 {
 			config.CloudProviderBackoffExponent = backoffExponentDefault
-		} else if config.shouldOmitCloudProviderBackoff() {
-			klog.Warning("Azure cloud provider config 'cloudProviderBackoffExponent' has been deprecated for 'v2' backoff mode. 2 is always used as the backoff exponent.")
-		}
-		if config.CloudProviderBackoffJitter == 0 {
-			config.CloudProviderBackoffJitter = backoffJitterDefault
-		} else if config.shouldOmitCloudProviderBackoff() {
-			klog.Warning("Azure cloud provider config 'cloudProviderBackoffJitter' has been deprecated for 'v2' backoff mode.")
 		}
 
-		if !config.shouldOmitCloudProviderBackoff() {
-			resourceRequestBackoff = wait.Backoff{
-				Steps:    config.CloudProviderBackoffRetries,
-				Factor:   config.CloudProviderBackoffExponent,
-				Duration: time.Duration(config.CloudProviderBackoffDuration) * time.Second,
-				Jitter:   config.CloudProviderBackoffJitter,
-			}
+		if config.CloudProviderBackoffJitter == 0 {
+			config.CloudProviderBackoffJitter = backoffJitterDefault
+		}
+
+		resourceRequestBackoff = wait.Backoff{
+			Steps:    config.CloudProviderBackoffRetries,
+			Factor:   config.CloudProviderBackoffExponent,
+			Duration: time.Duration(config.CloudProviderBackoffDuration) * time.Second,
+			Jitter:   config.CloudProviderBackoffJitter,
 		}
 		klog.V(2).Infof("Azure cloudprovider using try backoff: retries=%d, exponent=%f, duration=%d, jitter=%f",
 			config.CloudProviderBackoffRetries,
@@ -462,44 +490,33 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 		return nil
 	}
 
-	// Initialize Azure clients.
-	azClientConfig := &azClientConfig{
-		subscriptionID:                 config.SubscriptionID,
-		resourceManagerEndpoint:        env.ResourceManagerEndpoint,
-		servicePrincipalToken:          servicePrincipalToken,
-		rateLimiterReader:              operationPollRateLimiter,
-		rateLimiterWriter:              operationPollRateLimiterWrite,
-		CloudProviderBackoffRetries:    config.CloudProviderBackoffRetries,
-		CloudProviderBackoffDuration:   config.CloudProviderBackoffDuration,
-		ShouldOmitCloudProviderBackoff: config.shouldOmitCloudProviderBackoff(),
+	// If uses network resources in different AAD Tenant, then prepare corresponding Service Principal Token for VM/VMSS client and network resources client
+	var multiTenantServicePrincipalToken *adal.MultiTenantServicePrincipalToken
+	var networkResourceServicePrincipalToken *adal.ServicePrincipalToken
+	if az.Config.UsesNetworkResourceInDifferentTenant() {
+		multiTenantServicePrincipalToken, err = auth.GetMultiTenantServicePrincipalToken(&az.Config.AzureAuthConfig, &az.Environment)
+		if err != nil {
+			return err
+		}
+		networkResourceServicePrincipalToken, err = auth.GetNetworkResourceServicePrincipalToken(&az.Config.AzureAuthConfig, &az.Environment)
+		if err != nil {
+			return err
+		}
 	}
-	az.DisksClient = newAzDisksClient(azClientConfig)
-	az.SnapshotsClient = newSnapshotsClient(azClientConfig)
-	az.RoutesClient = newAzRoutesClient(azClientConfig)
-	az.SubnetsClient = newAzSubnetsClient(azClientConfig)
-	az.InterfacesClient = newAzInterfacesClient(azClientConfig)
-	az.RouteTablesClient = newAzRouteTablesClient(azClientConfig)
-	az.LoadBalancerClient = newAzLoadBalancersClient(azClientConfig)
-	az.SecurityGroupsClient = newAzSecurityGroupsClient(azClientConfig)
-	az.StorageAccountClient = newAzStorageAccountClient(azClientConfig)
-	az.VirtualMachinesClient = newAzVirtualMachinesClient(azClientConfig)
-	az.PublicIPAddressesClient = newAzPublicIPAddressesClient(azClientConfig)
-	az.VirtualMachineSizesClient = newAzVirtualMachineSizesClient(azClientConfig)
-	az.VirtualMachineScaleSetsClient = newAzVirtualMachineScaleSetsClient(azClientConfig)
-	az.VirtualMachineScaleSetVMsClient = newAzVirtualMachineScaleSetVMsClient(azClientConfig)
-	az.FileClient = &azureFileClient{env: *env}
+
+	az.configAzureClients(servicePrincipalToken, multiTenantServicePrincipalToken, networkResourceServicePrincipalToken)
 
 	if az.MaximumLoadBalancerRuleCount == 0 {
 		az.MaximumLoadBalancerRuleCount = maximumLoadBalancerRuleCount
 	}
 
 	if strings.EqualFold(vmTypeVMSS, az.Config.VMType) {
-		az.vmSet, err = newScaleSet(az)
+		az.VMSet, err = newScaleSet(az)
 		if err != nil {
 			return err
 		}
 	} else {
-		az.vmSet = newAvailabilitySet(az)
+		az.VMSet = newAvailabilitySet(az)
 	}
 
 	az.vmCache, err = az.newVMCache()
@@ -533,6 +550,99 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 	return nil
 }
 
+func (az *Cloud) configAzureClients(
+	servicePrincipalToken *adal.ServicePrincipalToken,
+	multiTenantServicePrincipalToken *adal.MultiTenantServicePrincipalToken,
+	networkResourceServicePrincipalToken *adal.ServicePrincipalToken) {
+	azClientConfig := az.getAzureClientConfig(servicePrincipalToken)
+
+	// Prepare AzureClientConfig for all azure clients
+	interfaceClientConfig := azClientConfig.WithRateLimiter(az.Config.InterfaceRateLimit)
+	vmSizeClientConfig := azClientConfig.WithRateLimiter(az.Config.VirtualMachineSizeRateLimit)
+	snapshotClientConfig := azClientConfig.WithRateLimiter(az.Config.SnapshotRateLimit)
+	storageAccountClientConfig := azClientConfig.WithRateLimiter(az.Config.StorageAccountRateLimit)
+	diskClientConfig := azClientConfig.WithRateLimiter(az.Config.DiskRateLimit)
+	vmClientConfig := azClientConfig.WithRateLimiter(az.Config.VirtualMachineRateLimit)
+	vmssClientConfig := azClientConfig.WithRateLimiter(az.Config.VirtualMachineScaleSetRateLimit)
+	// Error "not an active Virtual Machine Scale Set VM" is not retriable for VMSS VM.
+	// But http.StatusNotFound is retriable because of ARM replication latency.
+	vmssVMClientConfig := azClientConfig.WithRateLimiter(az.Config.VirtualMachineScaleSetRateLimit)
+	vmssVMClientConfig.Backoff = vmssVMClientConfig.Backoff.WithNonRetriableErrors([]string{vmssVMNotActiveErrorMessage}).WithRetriableHTTPStatusCodes([]int{http.StatusNotFound})
+	routeClientConfig := azClientConfig.WithRateLimiter(az.Config.RouteRateLimit)
+	subnetClientConfig := azClientConfig.WithRateLimiter(az.Config.SubnetsRateLimit)
+	routeTableClientConfig := azClientConfig.WithRateLimiter(az.Config.RouteTableRateLimit)
+	loadBalancerClientConfig := azClientConfig.WithRateLimiter(az.Config.LoadBalancerRateLimit)
+	securityGroupClientConfig := azClientConfig.WithRateLimiter(az.Config.SecurityGroupRateLimit)
+	publicIPClientConfig := azClientConfig.WithRateLimiter(az.Config.PublicIPAddressRateLimit)
+	// TODO(ZeroMagic): add azurefileRateLimit
+	fileClientConfig := azClientConfig.WithRateLimiter(nil)
+
+	// If uses network resources in different AAD Tenant, update Authorizer for VM/VMSS client config
+	if multiTenantServicePrincipalToken != nil {
+		multiTenantServicePrincipalTokenAuthorizer := autorest.NewMultiTenantServicePrincipalTokenAuthorizer(multiTenantServicePrincipalToken)
+		vmClientConfig.Authorizer = multiTenantServicePrincipalTokenAuthorizer
+		vmssClientConfig.Authorizer = multiTenantServicePrincipalTokenAuthorizer
+		vmssVMClientConfig.Authorizer = multiTenantServicePrincipalTokenAuthorizer
+	}
+
+	// If uses network resources in different AAD Tenant, update SubscriptionID and Authorizer for network resources client config
+	if networkResourceServicePrincipalToken != nil {
+		networkResourceServicePrincipalTokenAuthorizer := autorest.NewBearerAuthorizer(networkResourceServicePrincipalToken)
+		routeClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
+		subnetClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
+		routeTableClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
+		loadBalancerClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
+		securityGroupClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
+		publicIPClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
+
+		routeClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
+		subnetClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
+		routeTableClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
+		loadBalancerClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
+		securityGroupClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
+		publicIPClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
+	}
+
+	// Initialize all azure clients based on client config
+	az.InterfacesClient = interfaceclient.New(interfaceClientConfig)
+	az.VirtualMachineSizesClient = vmsizeclient.New(vmSizeClientConfig)
+	az.SnapshotsClient = snapshotclient.New(snapshotClientConfig)
+	az.StorageAccountClient = storageaccountclient.New(storageAccountClientConfig)
+	az.DisksClient = diskclient.New(diskClientConfig)
+	az.VirtualMachinesClient = vmclient.New(vmClientConfig)
+	az.VirtualMachineScaleSetsClient = vmssclient.New(vmssClientConfig)
+	az.VirtualMachineScaleSetVMsClient = vmssvmclient.New(vmssVMClientConfig)
+	az.RoutesClient = routeclient.New(routeClientConfig)
+	az.SubnetsClient = subnetclient.New(subnetClientConfig)
+	az.RouteTablesClient = routetableclient.New(routeTableClientConfig)
+	az.LoadBalancerClient = loadbalancerclient.New(loadBalancerClientConfig)
+	az.SecurityGroupsClient = securitygroupclient.New(securityGroupClientConfig)
+	az.PublicIPAddressesClient = publicipclient.New(publicIPClientConfig)
+	az.FileClient = fileclient.New(fileClientConfig)
+}
+
+func (az *Cloud) getAzureClientConfig(servicePrincipalToken *adal.ServicePrincipalToken) *azclients.ClientConfig {
+	azClientConfig := &azclients.ClientConfig{
+		CloudName:               az.Config.Cloud,
+		Location:                az.Config.Location,
+		SubscriptionID:          az.Config.SubscriptionID,
+		ResourceManagerEndpoint: az.Environment.ResourceManagerEndpoint,
+		Authorizer:              autorest.NewBearerAuthorizer(servicePrincipalToken),
+		Backoff:                 &retry.Backoff{Steps: 1},
+	}
+
+	if az.Config.CloudProviderBackoff {
+		azClientConfig.Backoff = &retry.Backoff{
+			Steps:    az.Config.CloudProviderBackoffRetries,
+			Factor:   az.Config.CloudProviderBackoffExponent,
+			Duration: time.Duration(az.Config.CloudProviderBackoffDuration) * time.Second,
+			Jitter:   az.Config.CloudProviderBackoffJitter,
+		}
+	}
+
+	return azClientConfig
+}
+
 // parseConfig returns a parsed configuration for an Azure cloudprovider config file
 func parseConfig(configReader io.Reader) (*Config, error) {
 	var config Config
@@ -558,9 +668,9 @@ func parseConfig(configReader io.Reader) (*Config, error) {
 
 // Initialize passes a Kubernetes clientBuilder interface to the cloud provider
 func (az *Cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
-	az.kubeClient = clientBuilder.ClientOrDie("azure-cloud-provider")
+	az.KubeClient = clientBuilder.ClientOrDie("azure-cloud-provider")
 	az.eventBroadcaster = record.NewBroadcaster()
-	az.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: az.kubeClient.CoreV1().Events("")})
+	az.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: az.KubeClient.CoreV1().Events("")})
 	az.eventRecorder = az.eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "azure-cloud-provider"})
 	az.InitializeCloudFromSecret()
 }
@@ -573,6 +683,12 @@ func (az *Cloud) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 // Instances returns an instances interface. Also returns true if the interface is supported, false otherwise.
 func (az *Cloud) Instances() (cloudprovider.Instances, bool) {
 	return az, true
+}
+
+// InstancesV2 returns an instancesV2 interface. Also returns true if the interface is supported, false otherwise.
+// TODO: implement ONLY for external cloud provider
+func (az *Cloud) InstancesV2() (cloudprovider.InstancesV2, bool) {
+	return nil, false
 }
 
 // Zones returns a zones interface. Also returns true if the interface is supported, false otherwise.
@@ -598,15 +714,6 @@ func (az *Cloud) HasClusterID() bool {
 // ProviderName returns the cloud provider ID.
 func (az *Cloud) ProviderName() string {
 	return CloudProviderName
-}
-
-// configureUserAgent configures the autorest client with a user agent that
-// includes "kubernetes" and the full kubernetes git version string
-// example:
-// Azure-SDK-for-Go/7.0.1-beta arm-network/2016-09-01; kubernetes-cloudprovider/v1.7.0-alpha.2.711+a2fadef8170bb0-dirty;
-func configureUserAgent(client *autorest.Client) {
-	k8sVersion := version.Get().GitVersion
-	client.UserAgent = fmt.Sprintf("%s; kubernetes-cloudprovider/%s", client.UserAgent, k8sVersion)
 }
 
 func initDiskControllers(az *Cloud) error {
@@ -641,8 +748,8 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 		UpdateFunc: func(prev, obj interface{}) {
 			prevNode := prev.(*v1.Node)
 			newNode := obj.(*v1.Node)
-			if newNode.Labels[v1.LabelZoneFailureDomain] ==
-				prevNode.Labels[v1.LabelZoneFailureDomain] {
+			if newNode.Labels[LabelFailureDomainBetaZone] ==
+				prevNode.Labels[LabelFailureDomainBetaZone] {
 				return
 			}
 			az.updateNodeCaches(prevNode, newNode)
@@ -676,7 +783,7 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
 
 	if prevNode != nil {
 		// Remove from nodeZones cache.
-		prevZone, ok := prevNode.ObjectMeta.Labels[v1.LabelZoneFailureDomain]
+		prevZone, ok := prevNode.ObjectMeta.Labels[LabelFailureDomainBetaZone]
 		if ok && az.isAvailabilityZone(prevZone) {
 			az.nodeZones[prevZone].Delete(prevNode.ObjectMeta.Name)
 			if az.nodeZones[prevZone].Len() == 0 {
@@ -699,7 +806,7 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
 
 	if newNode != nil {
 		// Add to nodeZones cache.
-		newZone, ok := newNode.ObjectMeta.Labels[v1.LabelZoneFailureDomain]
+		newZone, ok := newNode.ObjectMeta.Labels[LabelFailureDomainBetaZone]
 		if ok && az.isAvailabilityZone(newZone) {
 			if az.nodeZones[newZone] == nil {
 				az.nodeZones[newZone] = sets.NewString()
@@ -724,11 +831,11 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
 // GetActiveZones returns all the zones in which k8s nodes are currently running.
 func (az *Cloud) GetActiveZones() (sets.String, error) {
 	if az.nodeInformerSynced == nil {
-		return nil, fmt.Errorf("Azure cloud provider doesn't have informers set")
+		return nil, fmt.Errorf("azure cloud provider doesn't have informers set")
 	}
 
-	az.nodeCachesLock.Lock()
-	defer az.nodeCachesLock.Unlock()
+	az.nodeCachesLock.RLock()
+	defer az.nodeCachesLock.RUnlock()
 	if !az.nodeInformerSynced() {
 		return nil, fmt.Errorf("node informer is not synced when trying to GetActiveZones")
 	}
@@ -754,8 +861,8 @@ func (az *Cloud) GetNodeResourceGroup(nodeName string) (string, error) {
 		return az.ResourceGroup, nil
 	}
 
-	az.nodeCachesLock.Lock()
-	defer az.nodeCachesLock.Unlock()
+	az.nodeCachesLock.RLock()
+	defer az.nodeCachesLock.RUnlock()
 	if !az.nodeInformerSynced() {
 		return "", fmt.Errorf("node informer is not synced when trying to GetNodeResourceGroup")
 	}
@@ -776,8 +883,8 @@ func (az *Cloud) GetResourceGroups() (sets.String, error) {
 		return sets.NewString(az.ResourceGroup), nil
 	}
 
-	az.nodeCachesLock.Lock()
-	defer az.nodeCachesLock.Unlock()
+	az.nodeCachesLock.RLock()
+	defer az.nodeCachesLock.RUnlock()
 	if !az.nodeInformerSynced() {
 		return nil, fmt.Errorf("node informer is not synced when trying to GetResourceGroups")
 	}
@@ -797,8 +904,8 @@ func (az *Cloud) GetUnmanagedNodes() (sets.String, error) {
 		return nil, nil
 	}
 
-	az.nodeCachesLock.Lock()
-	defer az.nodeCachesLock.Unlock()
+	az.nodeCachesLock.RLock()
+	defer az.nodeCachesLock.RUnlock()
 	if !az.nodeInformerSynced() {
 		return nil, fmt.Errorf("node informer is not synced when trying to GetUnmanagedNodes")
 	}

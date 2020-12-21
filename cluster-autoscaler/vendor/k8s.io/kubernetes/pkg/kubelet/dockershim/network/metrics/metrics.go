@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2017 The Kubernetes Authors.
 
@@ -26,11 +28,11 @@ import (
 
 const (
 	// NetworkPluginOperationsKey is the key for operation count metrics.
-	NetworkPluginOperationsKey = "network_plugin_operations"
+	NetworkPluginOperationsKey = "network_plugin_operations_total"
 	// NetworkPluginOperationsLatencyKey is the key for the operation latency metrics.
 	NetworkPluginOperationsLatencyKey = "network_plugin_operations_duration_seconds"
-	// DeprecatedNetworkPluginOperationsLatencyKey is the deprecated key for the operation latency metrics.
-	DeprecatedNetworkPluginOperationsLatencyKey = "network_plugin_operations_latency_microseconds"
+	// NetworkPluginOperationsErrorsKey is the key for the operations error metrics.
+	NetworkPluginOperationsErrorsKey = "network_plugin_operations_errors_total"
 
 	// Keep the "kubelet" subsystem for backward compatibility.
 	kubeletSubsystem = "kubelet"
@@ -50,13 +52,23 @@ var (
 		[]string{"operation_type"},
 	)
 
-	// DeprecatedNetworkPluginOperationsLatency collects operation latency numbers by operation
-	// type.
-	DeprecatedNetworkPluginOperationsLatency = metrics.NewSummaryVec(
-		&metrics.SummaryOpts{
+	// NetworkPluginOperations collects operation counts by operation type.
+	NetworkPluginOperations = metrics.NewCounterVec(
+		&metrics.CounterOpts{
 			Subsystem:      kubeletSubsystem,
-			Name:           DeprecatedNetworkPluginOperationsLatencyKey,
-			Help:           "(Deprecated) Latency in microseconds of network plugin operations. Broken down by operation type.",
+			Name:           NetworkPluginOperationsKey,
+			Help:           "Cumulative number of network plugin operations by operation type.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"operation_type"},
+	)
+
+	// NetworkPluginOperationsErrors collects operation errors by operation type.
+	NetworkPluginOperationsErrors = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeletSubsystem,
+			Name:           NetworkPluginOperationsErrorsKey,
+			Help:           "Cumulative number of network plugin operation errors by operation type.",
 			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"operation_type"},
@@ -69,13 +81,9 @@ var registerMetrics sync.Once
 func Register() {
 	registerMetrics.Do(func() {
 		legacyregistry.MustRegister(NetworkPluginOperationsLatency)
-		legacyregistry.MustRegister(DeprecatedNetworkPluginOperationsLatency)
+		legacyregistry.MustRegister(NetworkPluginOperations)
+		legacyregistry.MustRegister(NetworkPluginOperationsErrors)
 	})
-}
-
-// SinceInMicroseconds gets the time since the specified start in microseconds.
-func SinceInMicroseconds(start time.Time) float64 {
-	return float64(time.Since(start).Nanoseconds() / time.Microsecond.Nanoseconds())
 }
 
 // SinceInSeconds gets the time since the specified start in seconds.

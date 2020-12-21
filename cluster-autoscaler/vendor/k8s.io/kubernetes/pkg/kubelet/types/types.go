@@ -26,7 +26,9 @@ import (
 
 // TODO: Reconcile custom types in kubelet/types and this subpackage
 
-type HttpGetter interface {
+// HTTPGetter is an interface representing the ability to perform HTTP GET requests.
+type HTTPGetter interface {
+	// Get issues a GET to the specified URL.
 	Get(url string) (*http.Response, error)
 }
 
@@ -83,6 +85,17 @@ func SortInitContainerStatuses(p *v1.Pod, statuses []v1.ContainerStatus) {
 			}
 		}
 	}
+}
+
+func SortStatusesOfInitContainers(p *v1.Pod, statusMap map[string]*v1.ContainerStatus) []v1.ContainerStatus {
+	containers := p.Spec.InitContainers
+	statuses := []v1.ContainerStatus{}
+	for _, container := range containers {
+		if status, found := statusMap[container.Name]; found {
+			statuses = append(statuses, *status)
+		}
+	}
+	return statuses
 }
 
 // Reservation represents reserved resources for non-pod components.

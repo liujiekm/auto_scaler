@@ -26,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/klog"
-	"k8s.io/utils/mount"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -71,7 +71,7 @@ func (util *AWSDiskUtil) DeleteVolume(d *awsElasticBlockStoreDeleter) error {
 }
 
 // CreateVolume creates an AWS EBS volume.
-// Returns: volumeID, volumeSizeGB, labels, error
+// Returns: volumeID, volumeSizeGB, labels, fstype, error
 func (util *AWSDiskUtil) CreateVolume(c *awsElasticBlockStoreProvisioner, node *v1.Node, allowedTopologies []v1.TopologySelectorTerm) (aws.KubernetesVolumeID, int, map[string]string, string, error) {
 	cloud, err := getCloudProvider(c.awsElasticBlockStore.plugin.host.GetCloudProvider())
 	if err != nil {
@@ -176,7 +176,7 @@ func populateVolumeOptions(pluginName, pvcName string, capacityGB resource.Quant
 		case "iopspergb":
 			volumeOptions.IOPSPerGB, err = strconv.Atoi(v)
 			if err != nil {
-				return nil, fmt.Errorf("invalid iopsPerGB value %q, must be integer between 1 and 30: %v", v, err)
+				return nil, fmt.Errorf("invalid iopsPerGB value %q: %v", v, err)
 			}
 		case "encrypted":
 			volumeOptions.Encrypted, err = strconv.ParseBool(v)
