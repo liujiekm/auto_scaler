@@ -18,14 +18,14 @@ package azure
 
 import (
 	"fmt"
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-12-01/compute"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	cloudvolume "k8s.io/cloud-provider/volume"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
 	"math/rand"
 	"regexp"
@@ -145,25 +145,6 @@ func buildNodeFromTemplate(scaleSetName string, template compute.VirtualMachineS
 	return &node, nil
 }
 
-func extractAllocatableResourcesFromScaleSet(tags map[string]*string) map[string]*resource.Quantity {
-	resources := make(map[string]*resource.Quantity)
-
-	for tagName, tagValue := range tags {
-		resourceName := strings.Split(tagName, nodeResourcesTagName)
-		if len(resourceName) < 2 || resourceName[1] == "" {
-			continue
-		}
-
-		quantity, err := resource.ParseQuantity(*tagValue)
-		if err != nil {
-			continue
-		}
-		resources[resourceName[1]] = &quantity
-	}
-
-	return resources
-}
-
 func extractLabelsFromScaleSet(tags map[string]*string) map[string]string {
 	result := make(map[string]string)
 
@@ -204,4 +185,23 @@ func extractTaintsFromScaleSet(tags map[string]*string) []apiv1.Taint {
 	}
 
 	return taints
+}
+
+func extractAllocatableResourcesFromScaleSet(tags map[string]*string) map[string]*resource.Quantity {
+	resources := make(map[string]*resource.Quantity)
+
+	for tagName, tagValue := range tags {
+		resourceName := strings.Split(tagName, nodeResourcesTagName)
+		if len(resourceName) < 2 || resourceName[1] == "" {
+			continue
+		}
+
+		quantity, err := resource.ParseQuantity(*tagValue)
+		if err != nil {
+			continue
+		}
+		resources[resourceName[1]] = &quantity
+	}
+
+	return resources
 }

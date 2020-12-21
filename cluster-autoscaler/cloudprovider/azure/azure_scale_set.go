@@ -18,6 +18,7 @@ package azure
 
 import (
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -26,18 +27,21 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
-	"k8s.io/klog"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	klog "k8s.io/klog/v2"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/legacy-cloud-providers/azure/retry"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-12-01/compute"
 	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/go-autorest/autorest/azure"
+	"github.com/Azure/go-autorest/autorest/to"
 )
 
 var (
-	defaultVmssSizeRefreshPeriod = 15 * time.Second
-	vmssInstancesRefreshPeriod   = 5 * time.Minute
-	vmssContextTimeout           = 3 * time.Minute
-	vmssSizeMutex                sync.Mutex
+	defaultVmssSizeRefreshPeriod      = 15 * time.Second
+	defaultVmssInstancesRefreshPeriod = 5 * time.Minute
+	vmssContextTimeout                = 3 * time.Minute
+	vmssSizeMutex                     sync.Mutex
 )
 
 var scaleSetStatusCache struct {
@@ -74,13 +78,16 @@ type ScaleSet struct {
 	lastSizeRefresh   time.Time
 	sizeRefreshPeriod time.Duration
 
+	instancesRefreshPeriod time.Duration
+	instancesRefreshJitter int
+
 	instanceMutex       sync.Mutex
 	instanceCache       []cloudprovider.Instance
 	lastInstanceRefresh time.Time
 }
 
 // NewScaleSet creates a new NewScaleSet.
-func NewScaleSet(spec *dynamic.NodeGroupSpec, az *AzureManager) (*ScaleSet, error) {
+func NewScaleSet(spec *dynamic.NodeGroupSpec, az *AzureManager, curSize int64) (*ScaleSet, error) {
 	scaleSet := &ScaleSet{
 		azureRef: azureRef{
 			Name: spec.Name,
@@ -88,13 +95,21 @@ func NewScaleSet(spec *dynamic.NodeGroupSpec, az *AzureManager) (*ScaleSet, erro
 		minSize: spec.MinSize,
 		maxSize: spec.MaxSize,
 		manager: az,
-		curSize: -1,
+		curSize: curSize,
+
+		instancesRefreshJitter: az.config.VmssVmsCacheJitter,
 	}
 
 	if az.config.VmssCacheTTL != 0 {
 		scaleSet.sizeRefreshPeriod = time.Duration(az.config.VmssCacheTTL) * time.Second
 	} else {
 		scaleSet.sizeRefreshPeriod = defaultVmssSizeRefreshPeriod
+	}
+
+	if az.config.VmssVmsCacheTTL != 0 {
+		scaleSet.instancesRefreshPeriod = time.Duration(az.config.VmssVmsCacheTTL) * time.Second
+	} else {
+		scaleSet.instancesRefreshPeriod = defaultVmssInstancesRefreshPeriod
 	}
 
 	return scaleSet, nil
@@ -132,7 +147,7 @@ func (scaleSet *ScaleSet) MaxSize() int {
 	return scaleSet.maxSize
 }
 
-func (scaleSet *ScaleSet) getVMSSInfo() (compute.VirtualMachineScaleSet, error) {
+func (scaleSet *ScaleSet) getVMSSInfo() (compute.VirtualMachineScaleSet, *retry.Error) {
 	scaleSetStatusCache.mutex.Lock()
 	defer scaleSetStatusCache.mutex.Unlock()
 
@@ -143,11 +158,11 @@ func (scaleSet *ScaleSet) getVMSSInfo() (compute.VirtualMachineScaleSet, error) 
 	}
 
 	var allVMSS []compute.VirtualMachineScaleSet
-	var err error
+	var rerr *retry.Error
 
-	allVMSS, err = scaleSet.getAllVMSSInfo()
-	if err != nil {
-		return compute.VirtualMachineScaleSet{}, err
+	allVMSS, rerr = scaleSet.getAllVMSSInfo()
+	if rerr != nil {
+		return compute.VirtualMachineScaleSet{}, rerr
 	}
 
 	var newStatus = make(map[string]compute.VirtualMachineScaleSet)
@@ -159,20 +174,20 @@ func (scaleSet *ScaleSet) getVMSSInfo() (compute.VirtualMachineScaleSet, error) 
 	scaleSetStatusCache.scaleSets = newStatus
 
 	if _, exists := scaleSetStatusCache.scaleSets[scaleSet.Name]; !exists {
-		return compute.VirtualMachineScaleSet{}, fmt.Errorf("could not find vmss: %s", scaleSet.Name)
+		return compute.VirtualMachineScaleSet{}, &retry.Error{RawError: fmt.Errorf("could not find vmss: %s", scaleSet.Name)}
 	}
 
 	return scaleSetStatusCache.scaleSets[scaleSet.Name], nil
 }
 
-func (scaleSet *ScaleSet) getAllVMSSInfo() ([]compute.VirtualMachineScaleSet, error) {
+func (scaleSet *ScaleSet) getAllVMSSInfo() ([]compute.VirtualMachineScaleSet, *retry.Error) {
 	ctx, cancel := getContextWithTimeout(vmssContextTimeout)
 	defer cancel()
 
 	resourceGroup := scaleSet.manager.config.ResourceGroup
-	setInfo, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.List(ctx, resourceGroup)
-	if err != nil {
-		return []compute.VirtualMachineScaleSet{}, err
+	setInfo, rerr := scaleSet.manager.azClient.virtualMachineScaleSetsClient.List(ctx, resourceGroup)
+	if rerr != nil {
+		return []compute.VirtualMachineScaleSet{}, rerr
 	}
 
 	return setInfo, nil
@@ -187,15 +202,21 @@ func (scaleSet *ScaleSet) getCurSize() (int64, error) {
 	}
 
 	klog.V(5).Infof("Get scale set size for %q", scaleSet.Name)
-	set, err := scaleSet.getVMSSInfo()
-	if err != nil {
-		if isAzureRequestsThrottled(err) {
+	set, rerr := scaleSet.getVMSSInfo()
+	if rerr != nil {
+		if isAzureRequestsThrottled(rerr) {
 			// Log a warning and update the size refresh time so that it would retry after next sizeRefreshPeriod.
-			klog.Warningf("getVMSSInfo() is throttled with message %v, would return the cached vmss size", err)
+			klog.Warningf("getVMSSInfo() is throttled with message %v, would return the cached vmss size", rerr)
 			scaleSet.lastSizeRefresh = time.Now()
 			return scaleSet.curSize, nil
 		}
-		return -1, err
+		return -1, rerr.Error()
+	}
+
+	// If VMSS state is updating, return the currentSize which would've been proactively incremented or decremented by CA
+	if set.VirtualMachineScaleSetProperties != nil && strings.EqualFold(to.String(set.VirtualMachineScaleSetProperties.ProvisioningState), string(compute.ProvisioningStateUpdating)) {
+		klog.V(5).Infof("VMSS %q is in updating state, returning cached size: %d", scaleSet.Name, scaleSet.curSize)
+		return scaleSet.curSize, nil
 	}
 
 	vmssSizeMutex.Lock()
@@ -219,58 +240,22 @@ func (scaleSet *ScaleSet) GetScaleSetSize() (int64, error) {
 	return scaleSet.getCurSize()
 }
 
-func (scaleSet *ScaleSet) waitForDeleteInstances(future compute.VirtualMachineScaleSetsDeleteInstancesFuture, requiredIds *compute.VirtualMachineScaleSetVMInstanceRequiredIDs) {
+func (scaleSet *ScaleSet) waitForDeleteInstances(future *azure.Future, requiredIds *compute.VirtualMachineScaleSetVMInstanceRequiredIDs) {
 	ctx, cancel := getContextWithCancel()
 	defer cancel()
-	klog.V(3).Infof("Calling virtualMachineScaleSetsClient.WaitForDeleteInstances(%v)", requiredIds.InstanceIds)
-	resp, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.WaitForDeleteInstances(ctx, future)
-	isSuccess, err := isSuccessHTTPResponse(resp, err)
+
+	klog.V(3).Infof("Calling virtualMachineScaleSetsClient.WaitForAsyncOperationResult - DeleteInstances(%v)", requiredIds.InstanceIds)
+	httpResponse, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.WaitForAsyncOperationResult(ctx, future)
+	isSuccess, err := isSuccessHTTPResponse(httpResponse, err)
 	if isSuccess {
-		klog.V(3).Infof("virtualMachineScaleSetsClient.WaitForDeleteInstances(%v) success", requiredIds.InstanceIds)
+		klog.V(3).Infof("virtualMachineScaleSetsClient.WaitForAsyncOperationResult - DeleteInstances(%v) success", requiredIds.InstanceIds)
 		return
 	}
-	klog.Errorf("virtualMachineScaleSetsClient.WaitForDeleteInstances for instances %v failed with error: %v", requiredIds.InstanceIds, err)
+	klog.Errorf("virtualMachineScaleSetsClient.WaitForAsyncOperationResult - DeleteInstances for instances %v failed with error: %v", requiredIds.InstanceIds, err)
 }
 
 // updateVMSSCapacity invokes virtualMachineScaleSetsClient to update the capacity for VMSS.
-func (scaleSet *ScaleSet) updateVMSSCapacity(size int64) error {
-	var vmssInfo compute.VirtualMachineScaleSet
-	var err error
-
-	vmssInfo, err = scaleSet.getVMSSInfo()
-	if err != nil {
-		klog.Errorf("Failed to get information for VMSS (%q): %v", scaleSet.Name, err)
-		return err
-	}
-
-	vmssSizeMutex.Lock()
-	vmssInfo.Sku.Capacity = &size
-	vmssSizeMutex.Unlock()
-
-	// Compose a new VMSS for updating.
-	op := compute.VirtualMachineScaleSet{
-		Name:     vmssInfo.Name,
-		Sku:      vmssInfo.Sku,
-		Location: vmssInfo.Location,
-	}
-	ctx, cancel := getContextWithTimeout(vmssContextTimeout)
-	defer cancel()
-	klog.V(3).Infof("Waiting for virtualMachineScaleSetsClient.CreateOrUpdateAsync(%s)", scaleSet.Name)
-	future, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.CreateOrUpdateAsync(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op)
-	if err != nil {
-		klog.Errorf("virtualMachineScaleSetsClient.CreateOrUpdateAsync for scale set %q failed: %v", scaleSet.Name, err)
-		return err
-	}
-
-	// Proactively set the VMSS size so autoscaler makes better decisions.
-	scaleSet.curSize = size
-	scaleSet.lastSizeRefresh = time.Now()
-
-	go scaleSet.waitForUpdateVMSSCapacity(future)
-	return nil
-}
-
-func (scaleSet *ScaleSet) waitForUpdateVMSSCapacity(future compute.VirtualMachineScaleSetsCreateOrUpdateFuture) {
+func (scaleSet *ScaleSet) updateVMSSCapacity(future *azure.Future) {
 	var err error
 
 	defer func() {
@@ -284,15 +269,17 @@ func (scaleSet *ScaleSet) waitForUpdateVMSSCapacity(future compute.VirtualMachin
 	ctx, cancel := getContextWithCancel()
 	defer cancel()
 
-	klog.V(3).Infof("Waiting for virtualMachineScaleSetsClient.WaitForCreateOrUpdate(%s)", scaleSet.Name)
-	resp, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.WaitForCreateOrUpdate(ctx, future)
-	isSuccess, err := isSuccessHTTPResponse(resp, err)
+	klog.V(3).Infof("Calling virtualMachineScaleSetsClient.WaitForAsyncOperationResult - updateVMSSCapacity(%s)", scaleSet.Name)
+	httpResponse, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.WaitForAsyncOperationResult(ctx, future)
+
+	isSuccess, err := isSuccessHTTPResponse(httpResponse, err)
 	if isSuccess {
-		klog.V(3).Infof("virtualMachineScaleSetsClient.WaitForCreateOrUpdate(%s) success", scaleSet.Name)
+		klog.V(3).Infof("virtualMachineScaleSetsClient.WaitForAsyncOperationResult - updateVMSSCapacity(%s) success", scaleSet.Name)
 		scaleSet.invalidateInstanceCache()
 		return
 	}
-	klog.Errorf("virtualMachineScaleSetsClient.WaitForCreateOrUpdate for scale set %q failed: %v", scaleSet.Name, err)
+
+	klog.Errorf("virtualMachineScaleSetsClient.WaitForAsyncOperationResult - updateVMSSCapacity for scale set %q failed: %v", scaleSet.Name, err)
 }
 
 // SetScaleSetSize sets ScaleSet size.
@@ -300,7 +287,38 @@ func (scaleSet *ScaleSet) SetScaleSetSize(size int64) error {
 	scaleSet.sizeMutex.Lock()
 	defer scaleSet.sizeMutex.Unlock()
 
-	return scaleSet.updateVMSSCapacity(size)
+	vmssInfo, rerr := scaleSet.getVMSSInfo()
+	if rerr != nil {
+		klog.Errorf("Failed to get information for VMSS (%q): %v", scaleSet.Name, rerr)
+		return rerr.Error()
+	}
+
+	// Update the new capacity to cache.
+	vmssSizeMutex.Lock()
+	vmssInfo.Sku.Capacity = &size
+	vmssSizeMutex.Unlock()
+
+	// Compose a new VMSS for updating.
+	op := compute.VirtualMachineScaleSet{
+		Name:     vmssInfo.Name,
+		Sku:      vmssInfo.Sku,
+		Location: vmssInfo.Location,
+	}
+	ctx, cancel := getContextWithTimeout(vmssContextTimeout)
+	defer cancel()
+	klog.V(3).Infof("Waiting for virtualMachineScaleSetsClient.CreateOrUpdateAsync(%s)", scaleSet.Name)
+	future, rerr := scaleSet.manager.azClient.virtualMachineScaleSetsClient.CreateOrUpdateAsync(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op)
+	if rerr != nil {
+		klog.Errorf("virtualMachineScaleSetsClient.CreateOrUpdate for scale set %q failed: %v", scaleSet.Name, rerr)
+		return rerr.Error()
+	}
+
+	// Proactively set the VMSS size so autoscaler makes better decisions.
+	scaleSet.curSize = size
+	scaleSet.lastSizeRefresh = time.Now()
+
+	go scaleSet.updateVMSSCapacity(future)
+	return nil
 }
 
 // TargetSize returns the current TARGET size of the node group. It is possible that the
@@ -333,17 +351,17 @@ func (scaleSet *ScaleSet) IncreaseSize(delta int) error {
 }
 
 // GetScaleSetVms returns list of nodes for the given scale set.
-func (scaleSet *ScaleSet) GetScaleSetVms() ([]compute.VirtualMachineScaleSetVM, error) {
+func (scaleSet *ScaleSet) GetScaleSetVms() ([]compute.VirtualMachineScaleSetVM, *retry.Error) {
 	klog.V(4).Infof("GetScaleSetVms: starts")
 	ctx, cancel := getContextWithTimeout(vmssContextTimeout)
 	defer cancel()
 
 	resourceGroup := scaleSet.manager.config.ResourceGroup
-	vmList, err := scaleSet.manager.azClient.virtualMachineScaleSetVMsClient.List(ctx, resourceGroup, scaleSet.Name, "", "", "")
+	vmList, rerr := scaleSet.manager.azClient.virtualMachineScaleSetVMsClient.List(ctx, resourceGroup, scaleSet.Name, "")
 	klog.V(4).Infof("GetScaleSetVms: scaleSet.Name: %s, vmList: %v", scaleSet.Name, vmList)
-	if err != nil {
-		klog.Errorf("VirtualMachineScaleSetVMsClient.List failed for %s: %v", scaleSet.Name, err)
-		return nil, err
+	if rerr != nil {
+		klog.Errorf("VirtualMachineScaleSetVMsClient.List failed for %s: %v", scaleSet.Name, rerr)
+		return nil, rerr
 	}
 
 	return vmList, nil
@@ -399,7 +417,7 @@ func (scaleSet *ScaleSet) DeleteInstances(instances []*azureRef) error {
 		return err
 	}
 
-	instanceIDs := []string{}
+	instancesToDelete := []*azureRef{}
 	for _, instance := range instances {
 		asg, err := scaleSet.manager.GetAsgForInstance(instance)
 		if err != nil {
@@ -414,20 +432,23 @@ func (scaleSet *ScaleSet) DeleteInstances(instances []*azureRef) error {
 			klog.V(3).Infof("Skipping deleting instance %s as its current state is deleting", instance.Name)
 			continue
 		}
+		instancesToDelete = append(instancesToDelete, instance)
+	}
 
+	// nothing to delete
+	if len(instancesToDelete) == 0 {
+		klog.V(3).Infof("No new instances eligible for deletion, skipping")
+		return nil
+	}
+
+	instanceIDs := []string{}
+	for _, instance := range instancesToDelete {
 		instanceID, err := getLastSegment(instance.Name)
 		if err != nil {
 			klog.Errorf("getLastSegment failed with error: %v", err)
 			return err
 		}
-
 		instanceIDs = append(instanceIDs, instanceID)
-	}
-
-	// nothing to delete
-	if len(instanceIDs) == 0 {
-		klog.V(3).Infof("No new instances eligible for deletion, skipping")
-		return nil
 	}
 
 	requiredIds := &compute.VirtualMachineScaleSetVMInstanceRequiredIDs{
@@ -440,11 +461,11 @@ func (scaleSet *ScaleSet) DeleteInstances(instances []*azureRef) error {
 
 	scaleSet.instanceMutex.Lock()
 	klog.V(3).Infof("Calling virtualMachineScaleSetsClient.DeleteInstancesAsync(%v)", requiredIds.InstanceIds)
-	future, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.DeleteInstancesAsync(ctx, resourceGroup, commonAsg.Id(), *requiredIds)
+	future, rerr := scaleSet.manager.azClient.virtualMachineScaleSetsClient.DeleteInstancesAsync(ctx, resourceGroup, commonAsg.Id(), *requiredIds)
 	scaleSet.instanceMutex.Unlock()
-	if err != nil {
-		klog.Errorf("virtualMachineScaleSetsClient.DeleteInstancesAsync for instances %v failed: %v", requiredIds.InstanceIds, err)
-		return err
+	if rerr != nil {
+		klog.Errorf("virtualMachineScaleSetsClient.DeleteInstancesAsync for instances %v failed: %v", requiredIds.InstanceIds, rerr)
+		return rerr.Error()
 	}
 
 	// Proactively decrement scale set size so that we don't
@@ -453,7 +474,13 @@ func (scaleSet *ScaleSet) DeleteInstances(instances []*azureRef) error {
 	scaleSet.curSize -= int64(len(instanceIDs))
 	scaleSet.sizeMutex.Unlock()
 
+	// Proactively set the status of the instances to be deleted in cache
+	for _, instance := range instancesToDelete {
+		scaleSet.setInstanceStatusByProviderID(instance.Name, cloudprovider.InstanceStatus{State: cloudprovider.InstanceDeleting})
+	}
+
 	go scaleSet.waitForDeleteInstances(future, requiredIds)
+
 	return nil
 }
 
@@ -500,10 +527,10 @@ func (scaleSet *ScaleSet) Debug() string {
 }
 
 // TemplateNodeInfo returns a node template for this scale set.
-func (scaleSet *ScaleSet) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error) {
-	template, err := scaleSet.getVMSSInfo()
-	if err != nil {
-		return nil, err
+func (scaleSet *ScaleSet) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+	template, rerr := scaleSet.getVMSSInfo()
+	if rerr != nil {
+		return nil, rerr.Error()
 	}
 
 	node, err := buildNodeFromTemplate(scaleSet.Name, template)
@@ -511,7 +538,7 @@ func (scaleSet *ScaleSet) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error
 		return nil, err
 	}
 
-	nodeInfo := schedulernodeinfo.NewNodeInfo(cloudprovider.BuildKubeProxy(scaleSet.Name))
+	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(scaleSet.Name))
 	nodeInfo.SetNode(node)
 	return nodeInfo, nil
 }
@@ -529,25 +556,28 @@ func (scaleSet *ScaleSet) Nodes() ([]cloudprovider.Instance, error) {
 	defer scaleSet.instanceMutex.Unlock()
 
 	if int64(len(scaleSet.instanceCache)) == curSize &&
-		scaleSet.lastInstanceRefresh.Add(vmssInstancesRefreshPeriod).After(time.Now()) {
+		scaleSet.lastInstanceRefresh.Add(scaleSet.instancesRefreshPeriod).After(time.Now()) {
 		klog.V(4).Infof("Nodes: returns with curSize %d", curSize)
 		return scaleSet.instanceCache, nil
 	}
 
 	klog.V(4).Infof("Nodes: starts to get VMSS VMs")
-	vms, err := scaleSet.GetScaleSetVms()
-	if err != nil {
-		if isAzureRequestsThrottled(err) {
-			// Log a warning and update the instance refresh time so that it would retry after next vmssInstancesRefreshPeriod.
-			klog.Warningf("GetScaleSetVms() is throttled with message %v, would return the cached instances", err)
-			scaleSet.lastInstanceRefresh = time.Now()
+	splay := rand.New(rand.NewSource(time.Now().UnixNano())).Intn(scaleSet.instancesRefreshJitter + 1)
+	lastRefresh := time.Now().Add(-time.Second * time.Duration(splay))
+
+	vms, rerr := scaleSet.GetScaleSetVms()
+	if rerr != nil {
+		if isAzureRequestsThrottled(rerr) {
+			// Log a warning and update the instance refresh time so that it would retry after cache expiration
+			klog.Warningf("GetScaleSetVms() is throttled with message %v, would return the cached instances", rerr)
+			scaleSet.lastInstanceRefresh = lastRefresh
 			return scaleSet.instanceCache, nil
 		}
-		return nil, err
+		return nil, rerr.Error()
 	}
 
 	scaleSet.instanceCache = buildInstanceCache(vms)
-	scaleSet.lastInstanceRefresh = time.Now()
+	scaleSet.lastInstanceRefresh = lastRefresh
 	klog.V(4).Infof("Nodes: returns")
 	return scaleSet.instanceCache, nil
 }
@@ -590,6 +620,17 @@ func (scaleSet *ScaleSet) getInstanceByProviderID(providerID string) (cloudprovi
 	return cloudprovider.Instance{}, false
 }
 
+func (scaleSet *ScaleSet) setInstanceStatusByProviderID(providerID string, status cloudprovider.InstanceStatus) {
+	scaleSet.instanceMutex.Lock()
+	defer scaleSet.instanceMutex.Unlock()
+	for k, instance := range scaleSet.instanceCache {
+		if instance.Id == providerID {
+			klog.V(5).Infof("Setting instance %s status to %v", instance.Id, status)
+			scaleSet.instanceCache[k].Status = &status
+		}
+	}
+}
+
 // instanceStatusFromVM converts the VM provisioning state to cloudprovider.InstanceStatus
 func instanceStatusFromVM(vm compute.VirtualMachineScaleSetVM) *cloudprovider.InstanceStatus {
 	if vm.ProvisioningState == nil {
@@ -612,7 +653,7 @@ func instanceStatusFromVM(vm compute.VirtualMachineScaleSetVM) *cloudprovider.In
 func (scaleSet *ScaleSet) invalidateInstanceCache() {
 	scaleSet.instanceMutex.Lock()
 	// Set the instanceCache as outdated.
-	scaleSet.lastInstanceRefresh = time.Now().Add(-1 * vmssInstancesRefreshPeriod)
+	scaleSet.lastInstanceRefresh = time.Now().Add(-1 * scaleSet.instancesRefreshPeriod)
 	scaleSet.instanceMutex.Unlock()
 }
 

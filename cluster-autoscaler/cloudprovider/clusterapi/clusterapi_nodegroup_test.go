@@ -17,6 +17,7 @@ limitations under the License.
 package clusterapi
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"sort"
@@ -280,7 +281,7 @@ func TestNodeGroupIncreaseSizeErrors(t *testing.T) {
 		}
 
 		scalableResource, err := ng.machineController.managementScaleClient.Scales(testConfig.spec.namespace).
-			Get(gvr.GroupResource(), ng.scalableResource.Name())
+			Get(context.TODO(), gvr.GroupResource(), ng.scalableResource.Name(), metav1.GetOptions{})
 
 		if scalableResource.Spec.Replicas != tc.initial {
 			t.Errorf("expected %v, got %v", tc.initial, scalableResource.Spec.Replicas)
@@ -353,7 +354,7 @@ func TestNodeGroupIncreaseSize(t *testing.T) {
 		}
 
 		scalableResource, err := ng.machineController.managementScaleClient.Scales(ng.scalableResource.Namespace()).
-			Get(gvr.GroupResource(), ng.scalableResource.Name())
+			Get(context.TODO(), gvr.GroupResource(), ng.scalableResource.Name(), metav1.GetOptions{})
 
 		if scalableResource.Spec.Replicas != tc.expected {
 			t.Errorf("expected %v, got %v", tc.expected, scalableResource.Spec.Replicas)
@@ -419,7 +420,7 @@ func TestNodeGroupDecreaseTargetSize(t *testing.T) {
 		// DecreaseTargetSize should only decrease the size when the current target size of the nodeGroup
 		// is bigger than the number existing instances for that group. We force such a scenario with targetSizeIncrement.
 		scalableResource, err := controller.managementScaleClient.Scales(testConfig.spec.namespace).
-			Get(gvr.GroupResource(), ng.scalableResource.Name())
+			Get(context.TODO(), gvr.GroupResource(), ng.scalableResource.Name(), metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -427,7 +428,7 @@ func TestNodeGroupDecreaseTargetSize(t *testing.T) {
 		scalableResource.Spec.Replicas += tc.targetSizeIncrement
 
 		_, err = ng.machineController.managementScaleClient.Scales(ng.scalableResource.Namespace()).
-			Update(gvr.GroupResource(), scalableResource)
+			Update(context.TODO(), gvr.GroupResource(), scalableResource, metav1.UpdateOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -453,7 +454,7 @@ func TestNodeGroupDecreaseTargetSize(t *testing.T) {
 		}
 
 		scalableResource, err = controller.managementScaleClient.Scales(testConfig.spec.namespace).
-			Get(gvr.GroupResource(), ng.scalableResource.Name())
+			Get(context.TODO(), gvr.GroupResource(), ng.scalableResource.Name(), metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -568,7 +569,7 @@ func TestNodeGroupDecreaseSizeErrors(t *testing.T) {
 		}
 
 		scalableResource, err := ng.machineController.managementScaleClient.Scales(testConfig.spec.namespace).
-			Get(gvr.GroupResource(), ng.scalableResource.Name())
+			Get(context.TODO(), gvr.GroupResource(), ng.scalableResource.Name(), metav1.GetOptions{})
 
 		if scalableResource.Spec.Replicas != tc.initial {
 			t.Errorf("expected %v, got %v", tc.initial, scalableResource.Spec.Replicas)
@@ -641,7 +642,7 @@ func TestNodeGroupDeleteNodes(t *testing.T) {
 		for i := 5; i < len(testConfig.machines); i++ {
 			machine, err := controller.managementClient.Resource(controller.machineResource).
 				Namespace(testConfig.spec.namespace).
-				Get(testConfig.machines[i].GetName(), metav1.GetOptions{})
+				Get(context.TODO(), testConfig.machines[i].GetName(), metav1.GetOptions{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -659,7 +660,7 @@ func TestNodeGroupDeleteNodes(t *testing.T) {
 		}
 
 		scalableResource, err := ng.machineController.managementScaleClient.Scales(testConfig.spec.namespace).
-			Get(gvr.GroupResource(), ng.scalableResource.Name())
+			Get(context.TODO(), gvr.GroupResource(), ng.scalableResource.Name(), metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -786,7 +787,7 @@ func TestNodeGroupDeleteNodesTwice(t *testing.T) {
 		m.SetDeletionTimestamp(&now)
 
 		if _, err := controller.managementClient.Resource(controller.machineResource).
-			Namespace(m.GetNamespace()).Update(m, metav1.UpdateOptions{}); err != nil {
+			Namespace(m.GetNamespace()).Update(context.TODO(), m, metav1.UpdateOptions{}); err != nil {
 			return err
 		}
 
@@ -922,7 +923,7 @@ func TestNodeGroupDeleteNodesTwice(t *testing.T) {
 		}
 
 		scalableResource, err := ng.machineController.managementScaleClient.Scales(testConfig.spec.namespace).
-			Get(gvr.GroupResource(), ng.scalableResource.Name())
+			Get(context.TODO(), gvr.GroupResource(), ng.scalableResource.Name(), metav1.GetOptions{})
 
 		if scalableResource.Spec.Replicas != int32(expectedSize) {
 			t.Errorf("expected %v, got %v", expectedSize, scalableResource.Spec.Replicas)

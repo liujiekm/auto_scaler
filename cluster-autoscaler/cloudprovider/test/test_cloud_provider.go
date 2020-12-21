@@ -24,7 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // OnScaleUpFunc is a function called on node group increase in TestCloudProvider.
@@ -50,7 +50,7 @@ type TestCloudProvider struct {
 	onNodeGroupCreate func(string) error
 	onNodeGroupDelete func(string) error
 	machineTypes      []string
-	machineTemplates  map[string]*schedulernodeinfo.NodeInfo
+	machineTemplates  map[string]*schedulerframework.NodeInfo
 	priceModel        cloudprovider.PricingModel
 	resourceLimiter   *cloudprovider.ResourceLimiter
 }
@@ -69,7 +69,7 @@ func NewTestCloudProvider(onScaleUp OnScaleUpFunc, onScaleDown OnScaleDownFunc) 
 // NewTestAutoprovisioningCloudProvider builds new TestCloudProvider with autoprovisioning support
 func NewTestAutoprovisioningCloudProvider(onScaleUp OnScaleUpFunc, onScaleDown OnScaleDownFunc,
 	onNodeGroupCreate OnNodeGroupCreateFunc, onNodeGroupDelete OnNodeGroupDeleteFunc,
-	machineTypes []string, machineTemplates map[string]*schedulernodeinfo.NodeInfo) *TestCloudProvider {
+	machineTypes []string, machineTemplates map[string]*schedulerframework.NodeInfo) *TestCloudProvider {
 	return &TestCloudProvider{
 		nodes:             make(map[string]string),
 		groups:            make(map[string]cloudprovider.NodeGroup),
@@ -165,6 +165,23 @@ func (tcp *TestCloudProvider) NewNodeGroup(machineType string, labels map[string
 	return &TestNodeGroup{
 		cloudProvider:   tcp,
 		id:              "autoprovisioned-" + machineType,
+		minSize:         0,
+		maxSize:         1000,
+		targetSize:      0,
+		exist:           false,
+		autoprovisioned: true,
+		machineType:     machineType,
+		labels:          labels,
+		taints:          taints,
+	}, nil
+}
+
+// NewNodeGroupWithId creates a new node group with custom ID suffix.
+func (tcp *TestCloudProvider) NewNodeGroupWithId(machineType string, labels map[string]string, systemLabels map[string]string,
+	taints []apiv1.Taint, extraResources map[string]resource.Quantity, id string) (cloudprovider.NodeGroup, error) {
+	return &TestNodeGroup{
+		cloudProvider:   tcp,
+		id:              "autoprovisioned-" + machineType + "-" + id,
 		minSize:         0,
 		maxSize:         1000,
 		targetSize:      0,
@@ -416,7 +433,7 @@ func (tng *TestNodeGroup) Autoprovisioned() bool {
 }
 
 // TemplateNodeInfo returns a node template for this node group.
-func (tng *TestNodeGroup) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error) {
+func (tng *TestNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	if tng.cloudProvider.machineTemplates == nil {
 		return nil, cloudprovider.ErrNotImplemented
 	}
@@ -442,4 +459,9 @@ func (tng *TestNodeGroup) Labels() map[string]string {
 // Taints returns taintspassed to the test node group when it was created.
 func (tng *TestNodeGroup) Taints() []apiv1.Taint {
 	return tng.taints
+}
+
+// MachineType returns machine type passed to the test node group when it was created.
+func (tng *TestNodeGroup) MachineType() string {
+	return tng.machineType
 }

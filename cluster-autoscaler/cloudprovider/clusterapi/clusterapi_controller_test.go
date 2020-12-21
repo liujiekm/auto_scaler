@@ -17,6 +17,7 @@ limitations under the License.
 package clusterapi
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -69,6 +70,7 @@ type testSpec struct {
 }
 
 const customCAPIGroup = "custom.x-k8s.io"
+const fifteenSecondDuration = time.Second * 15
 
 func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machineController, testControllerShutdownFunc) {
 	t.Helper()
@@ -92,7 +94,21 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 	}
 
 	kubeclientSet := fakekube.NewSimpleClientset(nodeObjects...)
-	dynamicClientset := fakedynamic.NewSimpleDynamicClient(runtime.NewScheme(), machineObjects...)
+	dynamicClientset := fakedynamic.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			{Group: "cluster.x-k8s.io", Version: "v1alpha3", Resource: "machinedeployments"}: "kindList",
+			{Group: "cluster.x-k8s.io", Version: "v1alpha3", Resource: "machines"}:           "kindList",
+			{Group: "cluster.x-k8s.io", Version: "v1alpha3", Resource: "machinesets"}:        "kindList",
+			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machinedeployments"}:  "kindList",
+			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machines"}:            "kindList",
+			{Group: "cluster.x-k8s.io", Version: "v1beta1", Resource: "machinesets"}:         "kindList",
+			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinedeployments"}:   "kindList",
+			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machines"}:             "kindList",
+			{Group: "custom.x-k8s.io", Version: "v1beta1", Resource: "machinesets"}:          "kindList",
+		},
+		machineObjects...,
+	)
 	discoveryClient := &fakediscovery.FakeDiscovery{
 		Fake: &clientgotesting.Fake{
 			Resources: []*metav1.APIResourceList{
@@ -161,7 +177,7 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 				return true, nil, fmt.Errorf("failed to convert Action to GetAction: %T", action)
 			}
 
-			u, err := dynamicClientset.Resource(gvr).Namespace(action.GetNamespace()).Get(action.GetName(), metav1.GetOptions{})
+			u, err := dynamicClientset.Resource(gvr).Namespace(action.GetNamespace()).Get(context.TODO(), action.GetName(), metav1.GetOptions{})
 			if err != nil {
 				return true, nil, err
 			}
@@ -197,7 +213,7 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 				return true, nil, fmt.Errorf("failed to convert Resource to Scale: %T", s)
 			}
 
-			u, err := dynamicClientset.Resource(gvr).Namespace(s.Namespace).Get(s.Name, metav1.GetOptions{})
+			u, err := dynamicClientset.Resource(gvr).Namespace(s.Namespace).Get(context.TODO(), s.Name, metav1.GetOptions{})
 			if err != nil {
 				return true, nil, fmt.Errorf("failed to fetch underlying %s resource: %s/%s", resource, s.Namespace, s.Name)
 			}
@@ -206,7 +222,7 @@ func mustCreateTestController(t *testing.T, testConfigs ...*testConfig) (*machin
 				return true, nil, err
 			}
 
-			_, err = dynamicClientset.Resource(gvr).Namespace(s.Namespace).Update(u, metav1.UpdateOptions{})
+			_, err = dynamicClientset.Resource(gvr).Namespace(s.Namespace).Update(context.TODO(), u, metav1.UpdateOptions{})
 			if err != nil {
 				return true, nil, err
 			}
@@ -439,11 +455,11 @@ func addTestConfigs(t *testing.T, controller *machineController, testConfigs ...
 }
 
 func createResource(client dynamic.Interface, informer informers.GenericInformer, gvr schema.GroupVersionResource, resource *unstructured.Unstructured) error {
-	if _, err := client.Resource(gvr).Namespace(resource.GetNamespace()).Create(resource.DeepCopy(), metav1.CreateOptions{}); err != nil {
+	if _, err := client.Resource(gvr).Namespace(resource.GetNamespace()).Create(context.TODO(), resource, metav1.CreateOptions{}); err != nil {
 		return err
 	}
 
-	return wait.PollImmediateInfinite(time.Microsecond, func() (bool, error) {
+	return wait.PollImmediate(time.Microsecond, fifteenSecondDuration, func() (bool, error) {
 		_, err := informer.Lister().ByNamespace(resource.GetNamespace()).Get(resource.GetName())
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -457,12 +473,12 @@ func createResource(client dynamic.Interface, informer informers.GenericInformer
 }
 
 func updateResource(client dynamic.Interface, informer informers.GenericInformer, gvr schema.GroupVersionResource, resource *unstructured.Unstructured) error {
-	updateResult, err := client.Resource(gvr).Namespace(resource.GetNamespace()).Update(resource.DeepCopy(), metav1.UpdateOptions{})
+	updateResult, err := client.Resource(gvr).Namespace(resource.GetNamespace()).Update(context.TODO(), resource, metav1.UpdateOptions{})
 	if err != nil {
 		return err
 	}
 
-	return wait.PollImmediateInfinite(time.Microsecond, func() (bool, error) {
+	return wait.PollImmediate(time.Microsecond, fifteenSecondDuration, func() (bool, error) {
 		result, err := informer.Lister().ByNamespace(resource.GetNamespace()).Get(resource.GetName())
 		if err != nil {
 			return false, err
@@ -472,11 +488,11 @@ func updateResource(client dynamic.Interface, informer informers.GenericInformer
 }
 
 func deleteResource(client dynamic.Interface, informer informers.GenericInformer, gvr schema.GroupVersionResource, resource *unstructured.Unstructured) error {
-	if err := client.Resource(gvr).Namespace(resource.GetNamespace()).Delete(resource.GetName(), &metav1.DeleteOptions{}); err != nil {
+	if err := client.Resource(gvr).Namespace(resource.GetNamespace()).Delete(context.TODO(), resource.GetName(), metav1.DeleteOptions{}); err != nil {
 		return err
 	}
 
-	return wait.PollImmediateInfinite(time.Microsecond, func() (bool, error) {
+	return wait.PollImmediate(time.Microsecond, fifteenSecondDuration, func() (bool, error) {
 		_, err := informer.Lister().ByNamespace(resource.GetNamespace()).Get(resource.GetName())
 		if err != nil && apierrors.IsNotFound(err) {
 			return true, nil
@@ -1374,7 +1390,7 @@ func TestControllerGetAPIVersionGroupWithMachineDeployments(t *testing.T) {
 	defer stop()
 
 	machineDeployments, err := controller.managementClient.Resource(controller.machineDeploymentResource).Namespace(testConfig.spec.namespace).
-		List(metav1.ListOptions{})
+		List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1384,7 +1400,7 @@ func TestControllerGetAPIVersionGroupWithMachineDeployments(t *testing.T) {
 	}
 
 	machineSets, err := controller.managementClient.Resource(controller.machineSetResource).Namespace(testConfig.spec.namespace).
-		List(metav1.ListOptions{})
+		List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1394,7 +1410,7 @@ func TestControllerGetAPIVersionGroupWithMachineDeployments(t *testing.T) {
 	}
 
 	machines, err := controller.managementClient.Resource(controller.machineResource).Namespace(testConfig.spec.namespace).
-		List(metav1.ListOptions{})
+		List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1460,60 +1476,6 @@ func TestGetAPIGroupPreferredVersion(t *testing.T) {
 	}
 }
 
-func TestIsFailedMachineProviderID(t *testing.T) {
-	testCases := []struct {
-		name       string
-		providerID normalizedProviderID
-		expected   bool
-	}{
-		{
-			name:       "with the failed machine prefix",
-			providerID: normalizedProviderID(fmt.Sprintf("%sfoo", failedMachinePrefix)),
-			expected:   true,
-		},
-		{
-			name:       "without the failed machine prefix",
-			providerID: normalizedProviderID("foo"),
-			expected:   false,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isFailedMachineProviderID(tc.providerID); got != tc.expected {
-				t.Errorf("test case: %s, expected: %v, got: %v", tc.name, tc.expected, got)
-			}
-		})
-	}
-}
-
-func TestMachineKeyFromFailedProviderID(t *testing.T) {
-	testCases := []struct {
-		name       string
-		providerID normalizedProviderID
-		expected   string
-	}{
-		{
-			name:       "with a valid failed machine prefix",
-			providerID: normalizedProviderID(fmt.Sprintf("%stest-namespace_foo", failedMachinePrefix)),
-			expected:   "test-namespace/foo",
-		},
-		{
-			name:       "with a machine with an underscore in the name",
-			providerID: normalizedProviderID(fmt.Sprintf("%stest-namespace_foo_bar", failedMachinePrefix)),
-			expected:   "test-namespace/foo_bar",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := machineKeyFromFailedProviderID(tc.providerID); got != tc.expected {
-				t.Errorf("test case: %s, expected: %q, got: %q", tc.name, tc.expected, got)
-			}
-		})
-	}
-}
-
 func TestGroupVersionHasResource(t *testing.T) {
 	testCases := []struct {
 		description  string
@@ -1573,6 +1535,60 @@ func TestGroupVersionHasResource(t *testing.T) {
 			}
 			if got != tc.expected {
 				t.Errorf("expected %v, got: %v", tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestIsFailedMachineProviderID(t *testing.T) {
+	testCases := []struct {
+		name       string
+		providerID normalizedProviderID
+		expected   bool
+	}{
+		{
+			name:       "with the failed machine prefix",
+			providerID: normalizedProviderID(fmt.Sprintf("%sfoo", failedMachinePrefix)),
+			expected:   true,
+		},
+		{
+			name:       "without the failed machine prefix",
+			providerID: normalizedProviderID("foo"),
+			expected:   false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isFailedMachineProviderID(tc.providerID); got != tc.expected {
+				t.Errorf("test case: %s, expected: %v, got: %v", tc.name, tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestMachineKeyFromFailedProviderID(t *testing.T) {
+	testCases := []struct {
+		name       string
+		providerID normalizedProviderID
+		expected   string
+	}{
+		{
+			name:       "with a valid failed machine prefix",
+			providerID: normalizedProviderID(fmt.Sprintf("%stest-namespace_foo", failedMachinePrefix)),
+			expected:   "test-namespace/foo",
+		},
+		{
+			name:       "with a machine with an underscore in the name",
+			providerID: normalizedProviderID(fmt.Sprintf("%stest-namespace_foo_bar", failedMachinePrefix)),
+			expected:   "test-namespace/foo_bar",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := machineKeyFromFailedProviderID(tc.providerID); got != tc.expected {
+				t.Errorf("test case: %s, expected: %q, got: %q", tc.name, tc.expected, got)
 			}
 		})
 	}

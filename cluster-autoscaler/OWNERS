@@ -1,11 +1,9 @@
 approvers:
-- piosz
 - aleksandra-malinowska
-- losipiuk
-reviewers:
 - feiskyer
-- piosz
+- vivekbagade
+reviewers:
 - aleksandra-malinowska
-- losipiuk
+- feiskyer
 - Jeffwan
 

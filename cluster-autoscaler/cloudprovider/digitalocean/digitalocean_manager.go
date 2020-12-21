@@ -24,10 +24,9 @@ import (
 	"io"
 	"io/ioutil"
 
+	"github.com/digitalocean/godo"
 	"golang.org/x/oauth2"
-
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/digitalocean/godo"
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 )
 
 var (

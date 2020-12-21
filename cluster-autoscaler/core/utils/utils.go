@@ -29,33 +29,26 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/daemonset"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/deletetaint"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/taints"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 )
-
-const (
-	// ReschedulerTaintKey is the name of the taint created by rescheduler.
-	ReschedulerTaintKey = "CriticalAddonsOnly"
-)
-
-type equivalenceGroupId int
 
 // GetNodeInfosForGroups finds NodeInfos for all node groups used to manage the given nodes. It also returns a node group to sample node mapping.
-func GetNodeInfosForGroups(nodes []*apiv1.Node, nodeInfoCache map[string]*schedulernodeinfo.NodeInfo, cloudProvider cloudprovider.CloudProvider, listers kube_util.ListerRegistry,
+func GetNodeInfosForGroups(nodes []*apiv1.Node, nodeInfoCache map[string]*schedulerframework.NodeInfo, cloudProvider cloudprovider.CloudProvider, listers kube_util.ListerRegistry,
 	// TODO(mwielgus): This returns map keyed by url, while most code (including scheduler) uses node.Name for a key.
 	// TODO(mwielgus): Review error policy - sometimes we may continue with partial errors.
-	daemonsets []*appsv1.DaemonSet, predicateChecker *simulator.PredicateChecker, ignoredTaints TaintKeySet) (map[string]*schedulernodeinfo.NodeInfo, errors.AutoscalerError) {
-	result := make(map[string]*schedulernodeinfo.NodeInfo)
+	daemonsets []*appsv1.DaemonSet, predicateChecker simulator.PredicateChecker, ignoredTaints taints.TaintKeySet) (map[string]*schedulerframework.NodeInfo, errors.AutoscalerError) {
+	result := make(map[string]*schedulerframework.NodeInfo)
 	seenGroups := make(map[string]bool)
 
 	podsForNodes, err := getPodsForNodes(listers)
 	if err != nil {
-		return map[string]*schedulernodeinfo.NodeInfo{}, err
+		return map[string]*schedulerframework.NodeInfo{}, err
 	}
 
 	// processNode returns information whether the nodeTemplate was generated and if there was an error.
@@ -91,7 +84,7 @@ func GetNodeInfosForGroups(nodes []*apiv1.Node, nodeInfoCache map[string]*schedu
 		}
 		added, id, typedErr := processNode(node)
 		if typedErr != nil {
-			return map[string]*schedulernodeinfo.NodeInfo{}, typedErr
+			return map[string]*schedulerframework.NodeInfo{}, typedErr
 		}
 		if added && nodeInfoCache != nil {
 			if nodeInfoCopy, err := deepCopyNodeInfo(result[id]); err == nil {
@@ -124,7 +117,7 @@ func GetNodeInfosForGroups(nodes []*apiv1.Node, nodeInfoCache map[string]*schedu
 				continue
 			} else {
 				klog.Errorf("Unable to build proper template node for %s: %v", id, err)
-				return map[string]*schedulernodeinfo.NodeInfo{}, errors.ToAutoscalerError(errors.CloudProviderError, err)
+				return map[string]*schedulerframework.NodeInfo{}, errors.ToAutoscalerError(errors.CloudProviderError, err)
 			}
 		}
 		result[id] = nodeInfo
@@ -143,11 +136,11 @@ func GetNodeInfosForGroups(nodes []*apiv1.Node, nodeInfoCache map[string]*schedu
 		if !kube_util.IsNodeReadyAndSchedulable(node) {
 			added, _, typedErr := processNode(node)
 			if typedErr != nil {
-				return map[string]*schedulernodeinfo.NodeInfo{}, typedErr
+				return map[string]*schedulerframework.NodeInfo{}, typedErr
 			}
 			nodeGroup, err := cloudProvider.NodeGroupForNode(node)
 			if err != nil {
-				return map[string]*schedulernodeinfo.NodeInfo{}, errors.ToAutoscalerError(
+				return map[string]*schedulerframework.NodeInfo{}, errors.ToAutoscalerError(
 					errors.CloudProviderError, err)
 			}
 			if added {
@@ -172,16 +165,21 @@ func getPodsForNodes(listers kube_util.ListerRegistry) (map[string][]*apiv1.Pod,
 }
 
 // GetNodeInfoFromTemplate returns NodeInfo object built base on TemplateNodeInfo returned by NodeGroup.TemplateNodeInfo().
-func GetNodeInfoFromTemplate(nodeGroup cloudprovider.NodeGroup, daemonsets []*appsv1.DaemonSet, predicateChecker *simulator.PredicateChecker, ignoredTaints TaintKeySet) (*schedulernodeinfo.NodeInfo, errors.AutoscalerError) {
+func GetNodeInfoFromTemplate(nodeGroup cloudprovider.NodeGroup, daemonsets []*appsv1.DaemonSet, predicateChecker simulator.PredicateChecker, ignoredTaints taints.TaintKeySet) (*schedulerframework.NodeInfo, errors.AutoscalerError) {
 	id := nodeGroup.Id()
 	baseNodeInfo, err := nodeGroup.TemplateNodeInfo()
 	if err != nil {
 		return nil, errors.ToAutoscalerError(errors.CloudProviderError, err)
 	}
 
-	pods := daemonset.GetDaemonSetPodsForNode(baseNodeInfo, daemonsets, predicateChecker)
-	pods = append(pods, baseNodeInfo.Pods()...)
-	fullNodeInfo := schedulernodeinfo.NewNodeInfo(pods...)
+	pods, err := daemonset.GetDaemonSetPodsForNode(baseNodeInfo, daemonsets, predicateChecker)
+	if err != nil {
+		return nil, errors.ToAutoscalerError(errors.InternalError, err)
+	}
+	for _, podInfo := range baseNodeInfo.Pods {
+		pods = append(pods, podInfo.Pod)
+	}
+	fullNodeInfo := schedulerframework.NewNodeInfo(pods...)
 	fullNodeInfo.SetNode(baseNodeInfo.Node())
 	sanitizedNodeInfo, typedErr := sanitizeNodeInfo(fullNodeInfo, id, ignoredTaints)
 	if typedErr != nil {
@@ -190,12 +188,21 @@ func GetNodeInfoFromTemplate(nodeGroup cloudprovider.NodeGroup, daemonsets []*ap
 	return sanitizedNodeInfo, nil
 }
 
+// isVirtualNode determines if the node is created by virtual kubelet
+func isVirtualNode(node *apiv1.Node) bool {
+	return node.ObjectMeta.Labels["type"] == "virtual-kubelet"
+}
+
 // FilterOutNodesFromNotAutoscaledGroups return subset of input nodes for which cloud provider does not
 // return autoscaled node group.
 func FilterOutNodesFromNotAutoscaledGroups(nodes []*apiv1.Node, cloudProvider cloudprovider.CloudProvider) ([]*apiv1.Node, errors.AutoscalerError) {
 	result := make([]*apiv1.Node, 0)
 
 	for _, node := range nodes {
+		// Exclude the virtual node here since it may have lots of resource and exceed the total resource limit
+		if isVirtualNode(node) {
+			continue
+		}
 		nodeGroup, err := cloudProvider.NodeGroupForNode(node)
 		if err != nil {
 			return []*apiv1.Node{}, errors.ToAutoscalerError(errors.CloudProviderError, err)
@@ -207,21 +214,21 @@ func FilterOutNodesFromNotAutoscaledGroups(nodes []*apiv1.Node, cloudProvider cl
 	return result, nil
 }
 
-func deepCopyNodeInfo(nodeInfo *schedulernodeinfo.NodeInfo) (*schedulernodeinfo.NodeInfo, errors.AutoscalerError) {
+func deepCopyNodeInfo(nodeInfo *schedulerframework.NodeInfo) (*schedulerframework.NodeInfo, errors.AutoscalerError) {
 	newPods := make([]*apiv1.Pod, 0)
-	for _, pod := range nodeInfo.Pods() {
-		newPods = append(newPods, pod.DeepCopy())
+	for _, podInfo := range nodeInfo.Pods {
+		newPods = append(newPods, podInfo.Pod.DeepCopy())
 	}
 
 	// Build a new node info.
-	newNodeInfo := schedulernodeinfo.NewNodeInfo(newPods...)
+	newNodeInfo := schedulerframework.NewNodeInfo(newPods...)
 	if err := newNodeInfo.SetNode(nodeInfo.Node().DeepCopy()); err != nil {
 		return nil, errors.ToAutoscalerError(errors.InternalError, err)
 	}
 	return newNodeInfo, nil
 }
 
-func sanitizeNodeInfo(nodeInfo *schedulernodeinfo.NodeInfo, nodeGroupName string, ignoredTaints TaintKeySet) (*schedulernodeinfo.NodeInfo, errors.AutoscalerError) {
+func sanitizeNodeInfo(nodeInfo *schedulerframework.NodeInfo, nodeGroupName string, ignoredTaints taints.TaintKeySet) (*schedulerframework.NodeInfo, errors.AutoscalerError) {
 	// Sanitize node name.
 	sanitizedNode, err := sanitizeTemplateNode(nodeInfo.Node(), nodeGroupName, ignoredTaints)
 	if err != nil {
@@ -230,21 +237,21 @@ func sanitizeNodeInfo(nodeInfo *schedulernodeinfo.NodeInfo, nodeGroupName string
 
 	// Update nodename in pods.
 	sanitizedPods := make([]*apiv1.Pod, 0)
-	for _, pod := range nodeInfo.Pods() {
-		sanitizedPod := pod.DeepCopy()
+	for _, podInfo := range nodeInfo.Pods {
+		sanitizedPod := podInfo.Pod.DeepCopy()
 		sanitizedPod.Spec.NodeName = sanitizedNode.Name
 		sanitizedPods = append(sanitizedPods, sanitizedPod)
 	}
 
 	// Build a new node info.
-	sanitizedNodeInfo := schedulernodeinfo.NewNodeInfo(sanitizedPods...)
+	sanitizedNodeInfo := schedulerframework.NewNodeInfo(sanitizedPods...)
 	if err := sanitizedNodeInfo.SetNode(sanitizedNode); err != nil {
 		return nil, errors.ToAutoscalerError(errors.InternalError, err)
 	}
 	return sanitizedNodeInfo, nil
 }
 
-func sanitizeTemplateNode(node *apiv1.Node, nodeGroup string, ignoredTaints TaintKeySet) (*apiv1.Node, errors.AutoscalerError) {
+func sanitizeTemplateNode(node *apiv1.Node, nodeGroup string, ignoredTaints taints.TaintKeySet) (*apiv1.Node, errors.AutoscalerError) {
 	newNode := node.DeepCopy()
 	nodeName := fmt.Sprintf("template-node-for-%s-%d", nodeGroup, rand.Int63())
 	newNode.Labels = make(map[string]string, len(node.Labels))
@@ -256,37 +263,7 @@ func sanitizeTemplateNode(node *apiv1.Node, nodeGroup string, ignoredTaints Tain
 		}
 	}
 	newNode.Name = nodeName
-	newTaints := make([]apiv1.Taint, 0)
-	for _, taint := range node.Spec.Taints {
-		// Rescheduler can put this taint on a node while evicting non-critical pods.
-		// New nodes will not have this taint and so we should strip it when creating
-		// template node.
-		switch taint.Key {
-		case ReschedulerTaintKey:
-			klog.V(4).Infof("Removing rescheduler taint when creating template from node %s", node.Name)
-			continue
-		case deletetaint.ToBeDeletedTaint:
-			klog.V(4).Infof("Removing autoscaler taint when creating template from node %s", node.Name)
-			continue
-		case deletetaint.DeletionCandidateTaint:
-			klog.V(4).Infof("Removing autoscaler soft taint when creating template from node %s", node.Name)
-			continue
-		}
-
-		// ignore conditional taints as they represent a transient node state.
-		if exists := NodeConditionTaints[taint.Key]; exists {
-			klog.V(4).Infof("Removing node condition taint %s, when creating template from node %s", taint.Key, node.Name)
-			continue
-		}
-
-		if exists := ignoredTaints[taint.Key]; exists {
-			klog.V(4).Infof("Removing ignored taint %s, when creating template from node %s", taint.Key, node.Name)
-			continue
-		}
-
-		newTaints = append(newTaints, taint)
-	}
-	newNode.Spec.Taints = newTaints
+	newNode.Spec.Taints = taints.SanitizeTaints(newNode.Spec.Taints, ignoredTaints)
 	return newNode, nil
 }
 
@@ -305,28 +282,6 @@ func hasHardInterPodAffinity(affinity *apiv1.Affinity) bool {
 		}
 	}
 	return false
-}
-
-func anyPodHasHardInterPodAffinity(pods []*apiv1.Pod) bool {
-	for _, pod := range pods {
-		if hasHardInterPodAffinity(pod.Spec.Affinity) {
-			return true
-		}
-	}
-	return false
-}
-
-// ConfigurePredicateCheckerForLoop can be run to update predicateChecker configuration
-// based on current state of the cluster.
-func ConfigurePredicateCheckerForLoop(unschedulablePods []*apiv1.Pod, schedulablePods []*apiv1.Pod, predicateChecker *simulator.PredicateChecker) {
-	podsWithAffinityFound := anyPodHasHardInterPodAffinity(unschedulablePods)
-	if !podsWithAffinityFound {
-		podsWithAffinityFound = anyPodHasHardInterPodAffinity(schedulablePods)
-	}
-	predicateChecker.SetAffinityPredicateEnabled(podsWithAffinityFound)
-	if !podsWithAffinityFound {
-		klog.V(1).Info("No pod using affinity / antiaffinity found in cluster, disabling affinity predicate for this loop")
-	}
 }
 
 // GetNodeCoresAndMemory extracts cpu and memory resources out of Node object

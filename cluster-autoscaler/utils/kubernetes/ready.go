@@ -67,8 +67,41 @@ func GetReadinessState(node *apiv1.Node) (isNodeReady bool, lastTransitionTime t
 			}
 		}
 	}
+
+	notReadyTaints := map[string]bool{
+		apiv1.TaintNodeNotReady:           true,
+		apiv1.TaintNodeDiskPressure:       true,
+		apiv1.TaintNodeNetworkUnavailable: true,
+	}
+	for _, taint := range node.Spec.Taints {
+		if notReadyTaints[taint.Key] {
+			canNodeBeReady = false
+			if taint.TimeAdded != nil && lastTransitionTime.Before(taint.TimeAdded.Time) {
+				lastTransitionTime = taint.TimeAdded.Time
+			}
+		}
+	}
+
 	if !readyFound {
 		return false, time.Time{}, fmt.Errorf("readiness information not found")
 	}
 	return canNodeBeReady, lastTransitionTime, nil
+}
+
+// GetUnreadyNodeCopy create a copy of the given node and override its NodeReady condition to False
+func GetUnreadyNodeCopy(node *apiv1.Node) *apiv1.Node {
+	newNode := node.DeepCopy()
+	newReadyCondition := apiv1.NodeCondition{
+		Type:               apiv1.NodeReady,
+		Status:             apiv1.ConditionFalse,
+		LastTransitionTime: node.CreationTimestamp,
+	}
+	newNodeConditions := []apiv1.NodeCondition{newReadyCondition}
+	for _, condition := range newNode.Status.Conditions {
+		if condition.Type != apiv1.NodeReady {
+			newNodeConditions = append(newNodeConditions, condition)
+		}
+	}
+	newNode.Status.Conditions = newNodeConditions
+	return newNode
 }

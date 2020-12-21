@@ -22,7 +22,6 @@ import (
 
 	testprovider "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/test"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/deletetaint"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	. "k8s.io/autoscaler/cluster-autoscaler/utils/test"
 
@@ -30,7 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 func TestGetNodeInfosForGroups(t *testing.T) {
@@ -44,13 +43,13 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 	SetNodeReadyState(unready4, false, time.Now())
 
 	tn := BuildTestNode("tn", 5000, 5000)
-	tni := schedulernodeinfo.NewNodeInfo()
+	tni := schedulerframework.NewNodeInfo()
 	tni.SetNode(tn)
 
 	// Cloud provider with TemplateNodeInfo implemented.
 	provider1 := testprovider.NewTestAutoprovisioningCloudProvider(
 		nil, nil, nil, nil, nil,
-		map[string]*schedulernodeinfo.NodeInfo{"ng3": tni, "ng4": tni})
+		map[string]*schedulerframework.NodeInfo{"ng3": tni, "ng4": tni})
 	provider1.AddNodeGroup("ng1", 1, 10, 1) // Nodegroup with ready node.
 	provider1.AddNode("ng1", ready1)
 	provider1.AddNodeGroup("ng2", 1, 10, 1) // Nodegroup with ready and unready node.
@@ -67,7 +66,8 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
 	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
 
-	predicateChecker := simulator.NewTestPredicateChecker()
+	predicateChecker, err := simulator.NewTestPredicateChecker()
+	assert.NoError(t, err)
 
 	res, err := GetNodeInfosForGroups([]*apiv1.Node{unready4, unready3, ready2, ready1}, nil,
 		provider1, registry, []*appsv1.DaemonSet{}, predicateChecker, nil)
@@ -108,7 +108,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	SetNodeReadyState(ready6, true, time.Now())
 
 	tn := BuildTestNode("tn", 10000, 10000)
-	tni := schedulernodeinfo.NewNodeInfo()
+	tni := schedulerframework.NewNodeInfo()
 	tni.SetNode(tn)
 
 	lastDeletedGroup := ""
@@ -120,7 +120,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	// Cloud provider with TemplateNodeInfo implemented.
 	provider1 := testprovider.NewTestAutoprovisioningCloudProvider(
 		nil, nil, nil, onDeleteGroup, nil,
-		map[string]*schedulernodeinfo.NodeInfo{"ng3": tni, "ng4": tni})
+		map[string]*schedulerframework.NodeInfo{"ng3": tni, "ng4": tni})
 	provider1.AddNodeGroup("ng1", 1, 10, 1) // Nodegroup with ready node.
 	provider1.AddNode("ng1", ready1)
 	provider1.AddNodeGroup("ng2", 1, 10, 1) // Nodegroup with ready and unready node.
@@ -135,9 +135,10 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
 	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
 
-	predicateChecker := simulator.NewTestPredicateChecker()
+	predicateChecker, err := simulator.NewTestPredicateChecker()
+	assert.NoError(t, err)
 
-	nodeInfoCache := make(map[string]*schedulernodeinfo.NodeInfo)
+	nodeInfoCache := make(map[string]*schedulerframework.NodeInfo)
 
 	// Fill cache
 	res, err := GetNodeInfosForGroups([]*apiv1.Node{unready4, unready3, ready2, ready1}, nodeInfoCache,
@@ -195,10 +196,10 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	assert.False(t, found)
 
 	// Fill cache manually
-	infoNg4Node6 := schedulernodeinfo.NewNodeInfo()
+	infoNg4Node6 := schedulerframework.NewNodeInfo()
 	err2 := infoNg4Node6.SetNode(ready6.DeepCopy())
 	assert.NoError(t, err2)
-	nodeInfoCache = map[string]*schedulernodeinfo.NodeInfo{"ng4": infoNg4Node6}
+	nodeInfoCache = map[string]*schedulerframework.NodeInfo{"ng4": infoNg4Node6}
 	// Check if cache was used
 	res, err = GetNodeInfosForGroups([]*apiv1.Node{ready1, ready2}, nodeInfoCache,
 		provider1, registry, []*appsv1.DaemonSet{}, predicateChecker, nil)
@@ -224,12 +225,12 @@ func TestSanitizeNodeInfo(t *testing.T) {
 
 	node := BuildTestNode("node", 1000, 1000)
 
-	nodeInfo := schedulernodeinfo.NewNodeInfo(pod)
+	nodeInfo := schedulerframework.NewNodeInfo(pod)
 	nodeInfo.SetNode(node)
 
 	res, err := sanitizeNodeInfo(nodeInfo, "test-group", nil)
 	assert.NoError(t, err)
-	assert.Equal(t, 1, len(res.Pods()))
+	assert.Equal(t, 1, len(res.Pods))
 }
 
 func TestSanitizeLabels(t *testing.T) {
@@ -244,97 +245,6 @@ func TestSanitizeLabels(t *testing.T) {
 	assert.Equal(t, node.Labels["x"], "y")
 	assert.NotEqual(t, node.Name, oldNode.Name)
 	assert.Equal(t, node.Labels[apiv1.LabelHostname], node.Name)
-}
-
-func TestSanitizeTaints(t *testing.T) {
-	oldNode := BuildTestNode("ng1-1", 1000, 1000)
-	taints := make([]apiv1.Taint, 0)
-	taints = append(taints, apiv1.Taint{
-		Key:    ReschedulerTaintKey,
-		Value:  "test1",
-		Effect: apiv1.TaintEffectNoSchedule,
-	})
-	taints = append(taints, apiv1.Taint{
-		Key:    "test-taint",
-		Value:  "test2",
-		Effect: apiv1.TaintEffectNoSchedule,
-	})
-	taints = append(taints, apiv1.Taint{
-		Key:    deletetaint.ToBeDeletedTaint,
-		Value:  "1",
-		Effect: apiv1.TaintEffectNoSchedule,
-	})
-	taints = append(taints, apiv1.Taint{
-		Key:    "ignore-me",
-		Value:  "1",
-		Effect: apiv1.TaintEffectNoSchedule,
-	})
-	taints = append(taints, apiv1.Taint{
-		Key:    "node.kubernetes.io/memory-pressure",
-		Value:  "1",
-		Effect: apiv1.TaintEffectNoSchedule,
-	})
-
-	ignoredTaints := map[string]bool{"ignore-me": true}
-
-	oldNode.Spec.Taints = taints
-	node, err := sanitizeTemplateNode(oldNode, "bzium", ignoredTaints)
-	assert.NoError(t, err)
-	assert.Equal(t, len(node.Spec.Taints), 1)
-	assert.Equal(t, node.Spec.Taints[0].Key, "test-taint")
-}
-
-func TestConfigurePredicateCheckerForLoop(t *testing.T) {
-	testCases := []struct {
-		affinity         *apiv1.Affinity
-		predicateEnabled bool
-	}{
-		{
-			&apiv1.Affinity{
-				PodAffinity: &apiv1.PodAffinity{
-					RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
-						{},
-					},
-				},
-			}, true},
-		{
-			&apiv1.Affinity{
-				PodAffinity: &apiv1.PodAffinity{
-					PreferredDuringSchedulingIgnoredDuringExecution: []apiv1.WeightedPodAffinityTerm{
-						{},
-					},
-				},
-			}, false},
-		{
-			&apiv1.Affinity{
-				PodAntiAffinity: &apiv1.PodAntiAffinity{
-					RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
-						{},
-					},
-				},
-			}, true},
-		{
-			&apiv1.Affinity{
-				PodAntiAffinity: &apiv1.PodAntiAffinity{
-					PreferredDuringSchedulingIgnoredDuringExecution: []apiv1.WeightedPodAffinityTerm{
-						{},
-					},
-				},
-			}, false},
-		{
-			&apiv1.Affinity{
-				NodeAffinity: &apiv1.NodeAffinity{},
-			}, false},
-	}
-
-	for _, tc := range testCases {
-		p := BuildTestPod("p", 500, 1000)
-		p.Spec.Affinity = tc.affinity
-		predicateChecker := simulator.NewTestPredicateChecker()
-		predicateChecker.SetAffinityPredicateEnabled(false)
-		ConfigurePredicateCheckerForLoop([]*apiv1.Pod{p}, []*apiv1.Pod{}, predicateChecker)
-		assert.Equal(t, tc.predicateEnabled, predicateChecker.IsAffinityPredicateEnabled())
-	}
 }
 
 func TestGetNodeResource(t *testing.T) {

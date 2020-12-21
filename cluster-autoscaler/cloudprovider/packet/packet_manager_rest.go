@@ -38,8 +38,8 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
-	"k8s.io/klog"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	klog "k8s.io/klog/v2"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 type instanceType struct {
@@ -613,7 +613,7 @@ func BuildGenericLabels(nodegroup string, instanceType string) map[string]string
 
 // templateNodeInfo returns a NodeInfo with a node template based on the packet plan
 // that is used to create nodes in a given node group.
-func (mgr *packetManagerRest) templateNodeInfo(nodegroup string) (*schedulernodeinfo.NodeInfo, error) {
+func (mgr *packetManagerRest) templateNodeInfo(nodegroup string) (*schedulerframework.NodeInfo, error) {
 	node := apiv1.Node{}
 	nodeName := fmt.Sprintf("%s-asg-%d", nodegroup, rand.Int63())
 	node.ObjectMeta = metav1.ObjectMeta{
@@ -640,7 +640,7 @@ func (mgr *packetManagerRest) templateNodeInfo(nodegroup string) (*schedulernode
 	// GenericLabels
 	node.Labels = cloudprovider.JoinStringMaps(node.Labels, BuildGenericLabels(nodegroup, mgr.getNodePoolDefinition(nodegroup).plan))
 
-	nodeInfo := schedulernodeinfo.NewNodeInfo(cloudprovider.BuildKubeProxy(nodegroup))
+	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(nodegroup))
 	nodeInfo.SetNode(&node)
 	return nodeInfo, nil
 }

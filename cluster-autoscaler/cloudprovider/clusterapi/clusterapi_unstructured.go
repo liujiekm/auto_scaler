@@ -17,6 +17,7 @@ limitations under the License.
 package clusterapi
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"time"
@@ -84,7 +85,7 @@ func (r unstructuredScalableResource) Replicas() (int, error) {
 		return 0, err
 	}
 
-	s, err := r.controller.managementScaleClient.Scales(r.Namespace()).Get(gvr.GroupResource(), r.Name())
+	s, err := r.controller.managementScaleClient.Scales(r.Namespace()).Get(context.TODO(), gvr.GroupResource(), r.Name(), metav1.GetOptions{})
 	if err != nil {
 		return 0, err
 	}
@@ -107,7 +108,7 @@ func (r unstructuredScalableResource) SetSize(nreplicas int) error {
 		return err
 	}
 
-	s, err := r.controller.managementScaleClient.Scales(r.Namespace()).Get(gvr.GroupResource(), r.Name())
+	s, err := r.controller.managementScaleClient.Scales(r.Namespace()).Get(context.TODO(), gvr.GroupResource(), r.Name(), metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -117,12 +118,12 @@ func (r unstructuredScalableResource) SetSize(nreplicas int) error {
 	}
 
 	s.Spec.Replicas = int32(nreplicas)
-	_, updateErr := r.controller.managementScaleClient.Scales(r.Namespace()).Update(gvr.GroupResource(), s)
+	_, updateErr := r.controller.managementScaleClient.Scales(r.Namespace()).Update(context.TODO(), gvr.GroupResource(), s, metav1.UpdateOptions{})
 	return updateErr
 }
 
 func (r unstructuredScalableResource) UnmarkMachineForDeletion(machine *unstructured.Unstructured) error {
-	u, err := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(machine.GetNamespace()).Get(machine.GetName(), metav1.GetOptions{})
+	u, err := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(machine.GetNamespace()).Get(context.TODO(), machine.GetName(), metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -131,13 +132,13 @@ func (r unstructuredScalableResource) UnmarkMachineForDeletion(machine *unstruct
 	delete(annotations, machineDeleteAnnotationKey)
 	delete(annotations, deprecatedMachineDeleteAnnotationKey)
 	u.SetAnnotations(annotations)
-	_, updateErr := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(u.GetNamespace()).Update(u, metav1.UpdateOptions{})
+	_, updateErr := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(u.GetNamespace()).Update(context.TODO(), u, metav1.UpdateOptions{})
 
 	return updateErr
 }
 
 func (r unstructuredScalableResource) MarkMachineForDeletion(machine *unstructured.Unstructured) error {
-	u, err := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(machine.GetNamespace()).Get(machine.GetName(), metav1.GetOptions{})
+	u, err := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(machine.GetNamespace()).Get(context.TODO(), machine.GetName(), metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -153,7 +154,7 @@ func (r unstructuredScalableResource) MarkMachineForDeletion(machine *unstructur
 	annotations[deprecatedMachineDeleteAnnotationKey] = time.Now().String()
 	u.SetAnnotations(annotations)
 
-	_, updateErr := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(u.GetNamespace()).Update(u, metav1.UpdateOptions{})
+	_, updateErr := r.controller.managementClient.Resource(r.controller.machineResource).Namespace(u.GetNamespace()).Update(context.TODO(), u, metav1.UpdateOptions{})
 
 	return updateErr
 }

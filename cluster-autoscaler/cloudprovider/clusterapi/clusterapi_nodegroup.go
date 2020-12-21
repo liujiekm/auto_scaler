@@ -21,7 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 )
@@ -230,7 +230,7 @@ func (ng *nodegroup) Nodes() ([]cloudprovider.Instance, error) {
 // allocatable information as well as all pods that are started on the
 // node by default, using manifest (most likely only kube-proxy).
 // Implementation optional.
-func (ng *nodegroup) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error) {
+func (ng *nodegroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 

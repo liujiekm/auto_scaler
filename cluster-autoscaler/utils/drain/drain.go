@@ -25,7 +25,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	pod_util "k8s.io/autoscaler/cluster-autoscaler/utils/pod"
 )
@@ -41,8 +40,39 @@ const (
 	PodSafeToEvictKey = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 )
 
+// BlockingPod represents a pod which is blocking the scale down of a node.
+type BlockingPod struct {
+	Pod    *apiv1.Pod
+	Reason BlockingPodReason
+}
+
+// BlockingPodReason represents a reason why a pod is blocking the scale down of a node.
+type BlockingPodReason int
+
+const (
+	// NoReason - sanity check, this should never be set explicitly. If this is found in the wild, it means that it was
+	// implicitly initialized and might indicate a bug.
+	NoReason BlockingPodReason = iota
+	// ControllerNotFound - pod is blocking scale down because its controller can't be found.
+	ControllerNotFound
+	// MinReplicasReached - pod is blocking scale down because its controller already has the minimum number of replicas.
+	MinReplicasReached
+	// NotReplicated - pod is blocking scale down because it's not replicated.
+	NotReplicated
+	// LocalStorageRequested - pod is blocking scale down because it requests local storage.
+	LocalStorageRequested
+	// NotSafeToEvictAnnotation - pod is blocking scale down because it has a "not safe to evict" annotation.
+	NotSafeToEvictAnnotation
+	// UnmovableKubeSystemPod - pod is blocking scale down because it's a non-daemonset, non-mirrored, non-pdb-assigned kube-system pod.
+	UnmovableKubeSystemPod
+	// NotEnoughPdb - pod is blocking scale down because it doesn't have enough PDB left.
+	NotEnoughPdb
+	// UnexpectedError - pod is blocking scale down because of an unexpected error.
+	UnexpectedError
+)
+
 // GetPodsForDeletionOnNodeDrain returns pods that should be deleted on node drain as well as some extra information
-// about possibly problematic pods (unreplicated and daemonsets).
+// about possibly problematic pods (unreplicated and DaemonSets).
 func GetPodsForDeletionOnNodeDrain(
 	podList []*apiv1.Pod,
 	pdbs []*policyv1.PodDisruptionBudget,
@@ -51,9 +81,10 @@ func GetPodsForDeletionOnNodeDrain(
 	checkReferences bool, // Setting this to true requires client to be not-null.
 	listers kube_util.ListerRegistry,
 	minReplica int32,
-	currentTime time.Time) ([]*apiv1.Pod, error) {
+	currentTime time.Time) (pods []*apiv1.Pod, daemonSetPods []*apiv1.Pod, blockingPod *BlockingPod, err error) {
 
-	pods := []*apiv1.Pod{}
+	pods = []*apiv1.Pod{}
+	daemonSetPods = []*apiv1.Pod{}
 	// filter kube-system PDBs to avoid doing it for every kube-system pod
 	kubeSystemPDBs := make([]*policyv1.PodDisruptionBudget, 0)
 	for _, pdb := range pdbs {
@@ -75,7 +106,7 @@ func GetPodsForDeletionOnNodeDrain(
 			continue
 		}
 
-		daemonsetPod := false
+		isDaemonSetPod := false
 		replicated := false
 		safeToEvict := hasSafeToEvictAnnotation(pod)
 		terminal := isPodTerminal(pod)
@@ -98,26 +129,26 @@ func GetPodsForDeletionOnNodeDrain(
 				// TODO: replace the minReplica check with pod disruption budget.
 				if err == nil && rc != nil {
 					if rc.Spec.Replicas != nil && *rc.Spec.Replicas < minReplica {
-						return []*apiv1.Pod{}, fmt.Errorf("replication controller for %s/%s has too few replicas spec: %d min: %d",
+						return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: MinReplicasReached}, fmt.Errorf("replication controller for %s/%s has too few replicas spec: %d min: %d",
 							pod.Namespace, pod.Name, rc.Spec.Replicas, minReplica)
 					}
 					replicated = true
 				} else {
-					return []*apiv1.Pod{}, fmt.Errorf("replication controller for %s/%s is not available, err: %v", pod.Namespace, pod.Name, err)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: ControllerNotFound}, fmt.Errorf("replication controller for %s/%s is not available, err: %v", pod.Namespace, pod.Name, err)
 				}
 			} else {
 				replicated = true
 			}
 		} else if pod_util.IsDaemonSetPod(pod) {
-			daemonsetPod = true
+			isDaemonSetPod = true
 			// don't have listener for other DaemonSet kind
 			// TODO: we should use a generic client for checking the reference.
 			if checkReferences && refKind == "DaemonSet" {
 				_, err := listers.DaemonSetLister().DaemonSets(controllerNamespace).Get(controllerRef.Name)
 				if apierrors.IsNotFound(err) {
-					return []*apiv1.Pod{}, fmt.Errorf("daemonset for %s/%s is not present, err: %v", pod.Namespace, pod.Name, err)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: ControllerNotFound}, fmt.Errorf("daemonset for %s/%s is not present, err: %v", pod.Namespace, pod.Name, err)
 				} else if err != nil {
-					return []*apiv1.Pod{}, fmt.Errorf("error when trying to get daemonset for %s/%s , err: %v", pod.Namespace, pod.Name, err)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: UnexpectedError}, fmt.Errorf("error when trying to get daemonset for %s/%s , err: %v", pod.Namespace, pod.Name, err)
 				}
 			}
 		} else if refKind == "Job" {
@@ -130,7 +161,7 @@ func GetPodsForDeletionOnNodeDrain(
 				if err == nil && job != nil {
 					replicated = true
 				} else {
-					return []*apiv1.Pod{}, fmt.Errorf("job for %s/%s is not available: err: %v", pod.Namespace, pod.Name, err)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: ControllerNotFound}, fmt.Errorf("job for %s/%s is not available: err: %v", pod.Namespace, pod.Name, err)
 				}
 			} else {
 				replicated = true
@@ -144,12 +175,12 @@ func GetPodsForDeletionOnNodeDrain(
 				// sophisticated than this
 				if err == nil && rs != nil {
 					if rs.Spec.Replicas != nil && *rs.Spec.Replicas < minReplica {
-						return []*apiv1.Pod{}, fmt.Errorf("replication controller for %s/%s has too few replicas spec: %d min: %d",
+						return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: MinReplicasReached}, fmt.Errorf("replication controller for %s/%s has too few replicas spec: %d min: %d",
 							pod.Namespace, pod.Name, rs.Spec.Replicas, minReplica)
 					}
 					replicated = true
 				} else {
-					return []*apiv1.Pod{}, fmt.Errorf("replication controller for %s/%s is not available, err: %v", pod.Namespace, pod.Name, err)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: ControllerNotFound}, fmt.Errorf("replication controller for %s/%s is not available, err: %v", pod.Namespace, pod.Name, err)
 				}
 			} else {
 				replicated = true
@@ -164,39 +195,40 @@ func GetPodsForDeletionOnNodeDrain(
 				if err == nil && ss != nil {
 					replicated = true
 				} else {
-					return []*apiv1.Pod{}, fmt.Errorf("statefulset for %s/%s is not available: err: %v", pod.Namespace, pod.Name, err)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: ControllerNotFound}, fmt.Errorf("statefulset for %s/%s is not available: err: %v", pod.Namespace, pod.Name, err)
 				}
 			} else {
 				replicated = true
 			}
 		}
-		if daemonsetPod {
+		if isDaemonSetPod {
+			daemonSetPods = append(daemonSetPods, pod)
 			continue
 		}
 
 		if !safeToEvict && !terminal {
 			if !replicated {
-				return []*apiv1.Pod{}, fmt.Errorf("%s/%s is not replicated", pod.Namespace, pod.Name)
+				return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: NotReplicated}, fmt.Errorf("%s/%s is not replicated", pod.Namespace, pod.Name)
 			}
 			if pod.Namespace == "kube-system" && skipNodesWithSystemPods {
 				hasPDB, err := checkKubeSystemPDBs(pod, kubeSystemPDBs)
 				if err != nil {
-					return []*apiv1.Pod{}, fmt.Errorf("error matching pods to pdbs: %v", err)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: UnexpectedError}, fmt.Errorf("error matching pods to pdbs: %v", err)
 				}
 				if !hasPDB {
-					return []*apiv1.Pod{}, fmt.Errorf("non-daemonset, non-mirrored, non-pdb-assigned kube-system pod present: %s", pod.Name)
+					return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: UnmovableKubeSystemPod}, fmt.Errorf("non-daemonset, non-mirrored, non-pdb-assigned kube-system pod present: %s", pod.Name)
 				}
 			}
 			if HasLocalStorage(pod) && skipNodesWithLocalStorage {
-				return []*apiv1.Pod{}, fmt.Errorf("pod with local storage present: %s", pod.Name)
+				return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: LocalStorageRequested}, fmt.Errorf("pod with local storage present: %s", pod.Name)
 			}
 			if hasNotSafeToEvictAnnotation(pod) {
-				return []*apiv1.Pod{}, fmt.Errorf("pod annotated as not safe to evict present: %s", pod.Name)
+				return []*apiv1.Pod{}, []*apiv1.Pod{}, &BlockingPod{Pod: pod, Reason: NotSafeToEvictAnnotation}, fmt.Errorf("pod annotated as not safe to evict present: %s", pod.Name)
 			}
 		}
 		pods = append(pods, pod)
 	}
-	return pods, nil
+	return pods, daemonSetPods, nil, nil
 }
 
 // ControllerRef returns the OwnerReference to pod's controller.

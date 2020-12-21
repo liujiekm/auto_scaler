@@ -26,11 +26,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	refv1 "k8s.io/client-go/tools/reference"
-	"k8s.io/kubernetes/pkg/api/testapi"
 
 	"github.com/stretchr/testify/mock"
 )
@@ -88,6 +84,11 @@ func RequestGpuForPod(pod *apiv1.Pod, gpusCount int64) {
 		pod.Spec.Containers[0].Resources.Requests = apiv1.ResourceList{}
 	}
 	pod.Spec.Containers[0].Resources.Requests[resourceNvidiaGPU] = *resource.NewQuantity(gpusCount, resource.DecimalSI)
+}
+
+// TolerateGpuForPod adds toleration for nvidia.com/gpu to Pod
+func TolerateGpuForPod(pod *apiv1.Pod) {
+	pod.Spec.Tolerations = append(pod.Spec.Tolerations, apiv1.Toleration{Key: resourceNvidiaGPU, Operator: apiv1.TolerationOpExists})
 }
 
 // BuildTestNode creates a node with specified capacity.
@@ -153,6 +154,11 @@ func SetNodeReadyState(node *apiv1.Node, ready bool, lastTransition time.Time) {
 		SetNodeCondition(node, apiv1.NodeReady, apiv1.ConditionTrue, lastTransition)
 	} else {
 		SetNodeCondition(node, apiv1.NodeReady, apiv1.ConditionFalse, lastTransition)
+		node.Spec.Taints = append(node.Spec.Taints, apiv1.Taint{
+			Key:    "node.kubernetes.io/not-ready",
+			Value:  "true",
+			Effect: apiv1.TaintEffectNoSchedule,
+		})
 	}
 }
 
@@ -172,18 +178,6 @@ func SetNodeCondition(node *apiv1.Node, conditionType apiv1.NodeConditionType, s
 		LastTransitionTime: metav1.Time{Time: lastTransition},
 	}
 	node.Status.Conditions = append(node.Status.Conditions, condition)
-}
-
-// RefJSON builds string reference to
-func RefJSON(o runtime.Object) string {
-	ref, err := refv1.GetReference(scheme.Scheme, o)
-	if err != nil {
-		panic(err)
-	}
-
-	codec := testapi.Default.Codec()
-	json := runtime.EncodeOrDie(codec, &apiv1.SerializedReference{Reference: *ref})
-	return string(json)
 }
 
 // GenerateOwnerReferences builds OwnerReferences with a single reference
@@ -231,7 +225,7 @@ func NewHttpServerMock() *HttpServerMock {
 	mux.HandleFunc("/",
 		func(w http.ResponseWriter, req *http.Request) {
 			result := httpServerMock.handle(req.URL.Path)
-			w.Write([]byte(result))
+			_, _ = w.Write([]byte(result))
 		})
 
 	server := httptest.NewServer(mux)
@@ -242,4 +236,25 @@ func NewHttpServerMock() *HttpServerMock {
 func (l *HttpServerMock) handle(url string) string {
 	args := l.Called(url)
 	return args.String(0)
+}
+
+// NewHttpServerMockWithStatusCode creates new HttpServerMock.
+func NewHttpServerMockWithStatusCode() *HttpServerMock {
+	httpServerMock := &HttpServerMock{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/",
+		func(w http.ResponseWriter, req *http.Request) {
+			code, result := httpServerMock.handleWithStatusCode(req.URL.Path)
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(result))
+		})
+
+	server := httptest.NewServer(mux)
+	httpServerMock.Server = server
+	return httpServerMock
+}
+
+func (l *HttpServerMock) handleWithStatusCode(url string) (int, string) {
+	args := l.Called(url)
+	return args.Int(0), args.String(1)
 }

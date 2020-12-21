@@ -34,9 +34,9 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 )
 
 const (
@@ -127,7 +127,7 @@ type ClusterStateRegistry struct {
 	scaleUpRequests                    map[string]*ScaleUpRequest // nodeGroupName -> ScaleUpRequest
 	scaleDownRequests                  []*ScaleDownRequest
 	nodes                              []*apiv1.Node
-	nodeInfosForGroups                 map[string]*schedulernodeinfo.NodeInfo
+	nodeInfosForGroups                 map[string]*schedulerframework.NodeInfo
 	cloudProvider                      cloudprovider.CloudProvider
 	perNodeGroupReadiness              map[string]Readiness
 	totalReadiness                     Readiness
@@ -287,7 +287,7 @@ func (csr *ClusterStateRegistry) backoffNodeGroup(nodeGroup cloudprovider.NodeGr
 func (csr *ClusterStateRegistry) RegisterFailedScaleUp(nodeGroup cloudprovider.NodeGroup, reason metrics.FailedScaleUpReason, currentTime time.Time) {
 	csr.Lock()
 	defer csr.Unlock()
-	csr.registerFailedScaleUpNoLock(nodeGroup, reason, cloudprovider.OtherErrorClass, "cloudProviderError", currentTime)
+	csr.registerFailedScaleUpNoLock(nodeGroup, reason, cloudprovider.OtherErrorClass, string(reason), currentTime)
 }
 
 func (csr *ClusterStateRegistry) registerFailedScaleUpNoLock(nodeGroup cloudprovider.NodeGroup, reason metrics.FailedScaleUpReason, errorClass cloudprovider.InstanceErrorClass, errorCode string, currentTime time.Time) {
@@ -297,7 +297,7 @@ func (csr *ClusterStateRegistry) registerFailedScaleUpNoLock(nodeGroup cloudprov
 }
 
 // UpdateNodes updates the state of the nodes in the ClusterStateRegistry and recalculates the stats
-func (csr *ClusterStateRegistry) UpdateNodes(nodes []*apiv1.Node, nodeInfosForGroups map[string]*schedulernodeinfo.NodeInfo, currentTime time.Time) error {
+func (csr *ClusterStateRegistry) UpdateNodes(nodes []*apiv1.Node, nodeInfosForGroups map[string]*schedulerframework.NodeInfo, currentTime time.Time) error {
 	csr.updateNodeGroupMetrics()
 	targetSizes, err := getTargetSizes(csr.cloudProvider)
 	if err != nil {
@@ -432,6 +432,11 @@ func (csr *ClusterStateRegistry) IsNodeGroupSafeToScaleUp(nodeGroup cloudprovide
 }
 
 func (csr *ClusterStateRegistry) getProvisionedAndTargetSizesForNodeGroup(nodeGroupName string) (provisioned, target int, ok bool) {
+	if len(csr.acceptableRanges) == 0 {
+		klog.Warningf("AcceptableRanges have not been populated yet. Skip checking")
+		return 0, 0, false
+	}
+
 	acceptable, found := csr.acceptableRanges[nodeGroupName]
 	if !found {
 		klog.Warningf("Failed to find acceptable ranges for %v", nodeGroupName)
@@ -855,22 +860,34 @@ func buildScaleDownStatusClusterwide(candidates map[string][]string, lastProbed 
 	return condition
 }
 
+func hasTaint(node *apiv1.Node, taintKey string) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == taintKey {
+			return true
+		}
+	}
+	return false
+}
+
 func isNodeStillStarting(node *apiv1.Node) bool {
 	for _, condition := range node.Status.Conditions {
-		if condition.Type == apiv1.NodeReady &&
-			condition.Status != apiv1.ConditionTrue &&
-			condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
-			return true
+		if condition.Type == apiv1.NodeReady {
+			notReady := condition.Status != apiv1.ConditionTrue || hasTaint(node, apiv1.TaintNodeNotReady)
+			if notReady && condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
+				return true
+			}
 		}
-		if condition.Type == apiv1.NodeDiskPressure &&
-			condition.Status == apiv1.ConditionTrue &&
-			condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
-			return true
+		if condition.Type == apiv1.NodeDiskPressure {
+			notReady := condition.Status == apiv1.ConditionTrue || hasTaint(node, apiv1.TaintNodeDiskPressure)
+			if notReady && condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
+				return true
+			}
 		}
-		if condition.Type == apiv1.NodeNetworkUnavailable &&
-			condition.Status == apiv1.ConditionTrue &&
-			condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
-			return true
+		if condition.Type == apiv1.NodeNetworkUnavailable {
+			notReady := condition.Status == apiv1.ConditionTrue || hasTaint(node, apiv1.TaintNodeNetworkUnavailable)
+			if notReady && condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
+				return true
+			}
 		}
 	}
 	return false

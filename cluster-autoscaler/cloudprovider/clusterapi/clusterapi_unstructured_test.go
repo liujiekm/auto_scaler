@@ -17,7 +17,10 @@ limitations under the License.
 package clusterapi
 
 import (
+	"context"
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestSetSize(t *testing.T) {
@@ -49,10 +52,7 @@ func TestSetSize(t *testing.T) {
 		}
 
 		s, err := sr.controller.managementScaleClient.Scales(testResource.GetNamespace()).
-			Get(gvr.GroupResource(), testResource.GetName())
-		if err != nil {
-			t.Fatal(err)
-		}
+			Get(context.TODO(), gvr.GroupResource(), testResource.GetName(), metav1.GetOptions{})
 
 		if s.Spec.Replicas != int32(updatedReplicas) {
 			t.Errorf("expected %v, got: %v", updatedReplicas, s.Spec.Replicas)
@@ -118,7 +118,7 @@ func TestReplicas(t *testing.T) {
 
 		// fetch and update machineSet
 		s, err := sr.controller.managementScaleClient.Scales(testResource.GetNamespace()).
-			Get(gvr.GroupResource(), testResource.GetName())
+			Get(context.TODO(), gvr.GroupResource(), testResource.GetName(), metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -126,7 +126,7 @@ func TestReplicas(t *testing.T) {
 		s.Spec.Replicas = int32(updatedReplicas)
 
 		_, err = sr.controller.managementScaleClient.Scales(testResource.GetNamespace()).
-			Update(gvr.GroupResource(), s)
+			Update(context.TODO(), gvr.GroupResource(), s, metav1.UpdateOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

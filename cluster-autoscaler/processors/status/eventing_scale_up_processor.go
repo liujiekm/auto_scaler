@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 
 	apiv1 "k8s.io/api/core/v1"
 
@@ -40,8 +40,8 @@ func (p *EventingScaleUpStatusProcessor) Process(context *context.AutoscalingCon
 	if status.Result != ScaleUpSuccessful && status.Result != ScaleUpError {
 		for _, noScaleUpInfo := range status.PodsRemainUnschedulable {
 			context.Recorder.Event(noScaleUpInfo.Pod, apiv1.EventTypeNormal, "NotTriggerScaleUp",
-				fmt.Sprintf("pod didn't trigger scale-up (it wouldn't fit if a new node is"+
-					" added): %s", ReasonsMessage(noScaleUpInfo, consideredNodeGroupsMap)))
+				fmt.Sprintf("pod didn't trigger scale-up: %s",
+					ReasonsMessage(noScaleUpInfo, consideredNodeGroupsMap)))
 		}
 	} else {
 		klog.V(4).Infof("Skipping event processing for unschedulable pods since there is a" +
