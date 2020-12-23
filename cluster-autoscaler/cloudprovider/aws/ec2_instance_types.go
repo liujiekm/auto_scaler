@@ -18,7 +18,6 @@ limitations under the License.
 
 package aws
 
-// InstanceType is spec of EC2 instance
 type InstanceType struct {
 	InstanceType string
 	VCPU         int64
@@ -538,6 +537,66 @@ var InstanceTypes = map[string]*InstanceType{
 		MemoryMb:     8192,
 		GPU:          0,
 	},
+	"c6gn": {
+		InstanceType: "c6gn",
+		VCPU:         64,
+		MemoryMb:     0,
+		GPU:          0,
+	},
+	"c6gn.12xlarge": {
+		InstanceType: "c6gn.12xlarge",
+		VCPU:         48,
+		MemoryMb:     98304,
+		GPU:          0,
+	},
+	"c6gn.16xlarge": {
+		InstanceType: "c6gn.16xlarge",
+		VCPU:         64,
+		MemoryMb:     131072,
+		GPU:          0,
+	},
+	"c6gn.2xlarge": {
+		InstanceType: "c6gn.2xlarge",
+		VCPU:         8,
+		MemoryMb:     16384,
+		GPU:          0,
+	},
+	"c6gn.4xlarge": {
+		InstanceType: "c6gn.4xlarge",
+		VCPU:         16,
+		MemoryMb:     32768,
+		GPU:          0,
+	},
+	"c6gn.8xlarge": {
+		InstanceType: "c6gn.8xlarge",
+		VCPU:         32,
+		MemoryMb:     65536,
+		GPU:          0,
+	},
+	"c6gn.large": {
+		InstanceType: "c6gn.large",
+		VCPU:         2,
+		MemoryMb:     4096,
+		GPU:          0,
+	},
+	"c6gn.medium": {
+		InstanceType: "c6gn.medium",
+		VCPU:         1,
+		MemoryMb:     2048,
+		GPU:          0,
+	},
+	"c6gn.metal": {
+		InstanceType: "c6gn.metal",
+		VCPU:         64,
+		MemoryMb:     131072,
+		GPU:          0,
+	},
+	"c6gn.xlarge": {
+		InstanceType: "c6gn.xlarge",
+		VCPU:         4,
+		MemoryMb:     8192,
+		GPU:          0,
+	},
 	"cc2.8xlarge": {
 		InstanceType: "cc2.8xlarge",
 		VCPU:         32,
@@ -578,6 +637,66 @@ var InstanceTypes = map[string]*InstanceType{
 		InstanceType: "d2.xlarge",
 		VCPU:         4,
 		MemoryMb:     31232,
+		GPU:          0,
+	},
+	"d3.2xlarge": {
+		InstanceType: "d3.2xlarge",
+		VCPU:         8,
+		MemoryMb:     65536,
+		GPU:          0,
+	},
+	"d3.4xlarge": {
+		InstanceType: "d3.4xlarge",
+		VCPU:         16,
+		MemoryMb:     131072,
+		GPU:          0,
+	},
+	"d3.8xlarge": {
+		InstanceType: "d3.8xlarge",
+		VCPU:         32,
+		MemoryMb:     262144,
+		GPU:          0,
+	},
+	"d3.xlarge": {
+		InstanceType: "d3.xlarge",
+		VCPU:         4,
+		MemoryMb:     32768,
+		GPU:          0,
+	},
+	"d3en.12xlarge": {
+		InstanceType: "d3en.12xlarge",
+		VCPU:         48,
+		MemoryMb:     196608,
+		GPU:          0,
+	},
+	"d3en.2xlarge": {
+		InstanceType: "d3en.2xlarge",
+		VCPU:         8,
+		MemoryMb:     32768,
+		GPU:          0,
+	},
+	"d3en.4xlarge": {
+		InstanceType: "d3en.4xlarge",
+		VCPU:         16,
+		MemoryMb:     65536,
+		GPU:          0,
+	},
+	"d3en.6xlarge": {
+		InstanceType: "d3en.6xlarge",
+		VCPU:         24,
+		MemoryMb:     98304,
+		GPU:          0,
+	},
+	"d3en.8xlarge": {
+		InstanceType: "d3en.8xlarge",
+		VCPU:         32,
+		MemoryMb:     131072,
+		GPU:          0,
+	},
+	"d3en.xlarge": {
+		InstanceType: "d3en.xlarge",
+		VCPU:         4,
+		MemoryMb:     16384,
 		GPU:          0,
 	},
 	"f1": {
@@ -651,6 +770,30 @@ var InstanceTypes = map[string]*InstanceType{
 		VCPU:         4,
 		MemoryMb:     31232,
 		GPU:          1,
+	},
+	"g4ad": {
+		InstanceType: "g4ad",
+		VCPU:         192,
+		MemoryMb:     0,
+		GPU:          2,
+	},
+	"g4ad.16xlarge": {
+		InstanceType: "g4ad.16xlarge",
+		VCPU:         64,
+		MemoryMb:     262144,
+		GPU:          4,
+	},
+	"g4ad.4xlarge": {
+		InstanceType: "g4ad.4xlarge",
+		VCPU:         16,
+		MemoryMb:     65536,
+		GPU:          1,
+	},
+	"g4ad.8xlarge": {
+		InstanceType: "g4ad.8xlarge",
+		VCPU:         32,
+		MemoryMb:     131072,
+		GPU:          2,
 	},
 	"g4dn": {
 		InstanceType: "g4dn",
@@ -1354,6 +1497,54 @@ var InstanceTypes = map[string]*InstanceType{
 		MemoryMb:     16384,
 		GPU:          0,
 	},
+	"m5zn": {
+		InstanceType: "m5zn",
+		VCPU:         48,
+		MemoryMb:     0,
+		GPU:          0,
+	},
+	"m5zn.12xlarge": {
+		InstanceType: "m5zn.12xlarge",
+		VCPU:         48,
+		MemoryMb:     196608,
+		GPU:          0,
+	},
+	"m5zn.2xlarge": {
+		InstanceType: "m5zn.2xlarge",
+		VCPU:         8,
+		MemoryMb:     32768,
+		GPU:          0,
+	},
+	"m5zn.3xlarge": {
+		InstanceType: "m5zn.3xlarge",
+		VCPU:         12,
+		MemoryMb:     49152,
+		GPU:          0,
+	},
+	"m5zn.6xlarge": {
+		InstanceType: "m5zn.6xlarge",
+		VCPU:         24,
+		MemoryMb:     98304,
+		GPU:          0,
+	},
+	"m5zn.large": {
+		InstanceType: "m5zn.large",
+		VCPU:         2,
+		MemoryMb:     8192,
+		GPU:          0,
+	},
+	"m5zn.metal": {
+		InstanceType: "m5zn.metal",
+		VCPU:         48,
+		MemoryMb:     196608,
+		GPU:          0,
+	},
+	"m5zn.xlarge": {
+		InstanceType: "m5zn.xlarge",
+		VCPU:         4,
+		MemoryMb:     16384,
+		GPU:          0,
+	},
 	"m6g": {
 		InstanceType: "m6g",
 		VCPU:         64,
@@ -1474,6 +1665,18 @@ var InstanceTypes = map[string]*InstanceType{
 		MemoryMb:     16384,
 		GPU:          0,
 	},
+	"mac1": {
+		InstanceType: "mac1",
+		VCPU:         12,
+		MemoryMb:     0,
+		GPU:          0,
+	},
+	"mac1.metal": {
+		InstanceType: "mac1.metal",
+		VCPU:         12,
+		MemoryMb:     32768,
+		GPU:          0,
+	},
 	"p2": {
 		InstanceType: "p2",
 		VCPU:         64,
@@ -1532,6 +1735,12 @@ var InstanceTypes = map[string]*InstanceType{
 		InstanceType: "p3dn.24xlarge",
 		VCPU:         96,
 		MemoryMb:     786432,
+		GPU:          8,
+	},
+	"p4d.24xlarge": {
+		InstanceType: "p4d.24xlarge",
+		VCPU:         96,
+		MemoryMb:     1179648,
 		GPU:          8,
 	},
 	"r3": {
@@ -1764,6 +1973,66 @@ var InstanceTypes = map[string]*InstanceType{
 	},
 	"r5ad.xlarge": {
 		InstanceType: "r5ad.xlarge",
+		VCPU:         4,
+		MemoryMb:     32768,
+		GPU:          0,
+	},
+	"r5b": {
+		InstanceType: "r5b",
+		VCPU:         96,
+		MemoryMb:     0,
+		GPU:          0,
+	},
+	"r5b.12xlarge": {
+		InstanceType: "r5b.12xlarge",
+		VCPU:         48,
+		MemoryMb:     393216,
+		GPU:          0,
+	},
+	"r5b.16xlarge": {
+		InstanceType: "r5b.16xlarge",
+		VCPU:         64,
+		MemoryMb:     524288,
+		GPU:          0,
+	},
+	"r5b.24xlarge": {
+		InstanceType: "r5b.24xlarge",
+		VCPU:         96,
+		MemoryMb:     786432,
+		GPU:          0,
+	},
+	"r5b.2xlarge": {
+		InstanceType: "r5b.2xlarge",
+		VCPU:         8,
+		MemoryMb:     65536,
+		GPU:          0,
+	},
+	"r5b.4xlarge": {
+		InstanceType: "r5b.4xlarge",
+		VCPU:         16,
+		MemoryMb:     131072,
+		GPU:          0,
+	},
+	"r5b.8xlarge": {
+		InstanceType: "r5b.8xlarge",
+		VCPU:         32,
+		MemoryMb:     262144,
+		GPU:          0,
+	},
+	"r5b.large": {
+		InstanceType: "r5b.large",
+		VCPU:         2,
+		MemoryMb:     16384,
+		GPU:          0,
+	},
+	"r5b.metal": {
+		InstanceType: "r5b.metal",
+		VCPU:         96,
+		MemoryMb:     786432,
+		GPU:          0,
+	},
+	"r5b.xlarge": {
+		InstanceType: "r5b.xlarge",
 		VCPU:         4,
 		MemoryMb:     32768,
 		GPU:          0,
@@ -2196,6 +2465,48 @@ var InstanceTypes = map[string]*InstanceType{
 	},
 	"t3a.xlarge": {
 		InstanceType: "t3a.xlarge",
+		VCPU:         4,
+		MemoryMb:     16384,
+		GPU:          0,
+	},
+	"t4g.2xlarge": {
+		InstanceType: "t4g.2xlarge",
+		VCPU:         8,
+		MemoryMb:     32768,
+		GPU:          0,
+	},
+	"t4g.large": {
+		InstanceType: "t4g.large",
+		VCPU:         2,
+		MemoryMb:     8192,
+		GPU:          0,
+	},
+	"t4g.medium": {
+		InstanceType: "t4g.medium",
+		VCPU:         2,
+		MemoryMb:     4096,
+		GPU:          0,
+	},
+	"t4g.micro": {
+		InstanceType: "t4g.micro",
+		VCPU:         2,
+		MemoryMb:     1024,
+		GPU:          0,
+	},
+	"t4g.nano": {
+		InstanceType: "t4g.nano",
+		VCPU:         2,
+		MemoryMb:     512,
+		GPU:          0,
+	},
+	"t4g.small": {
+		InstanceType: "t4g.small",
+		VCPU:         2,
+		MemoryMb:     2048,
+		GPU:          0,
+	},
+	"t4g.xlarge": {
+		InstanceType: "t4g.xlarge",
 		VCPU:         4,
 		MemoryMb:     16384,
 		GPU:          0,
